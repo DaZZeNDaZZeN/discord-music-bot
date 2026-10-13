@@ -77,6 +77,18 @@ class MyClient(discord.Client):
             voice_client.stop()
             self.play_next_song_in_queue()
 
+        if q.startswith("%queue"):
+            command = q.removeprefix("%queue").strip()
+            if command == "clear":
+                self.queue[text_channel.guild.id] = []
+            else:
+                queue = self.queue[text_channel.guild.id]
+                if queue:
+                    msg = ""
+                    for i in range(len(queue)):
+                        msg += f"{i + 1}. {queue[i]}\n\n"
+                    await text_channel.send(msg)
+
     def play_next_song_in_queue(self, error=None):
         if error is not None:
             raise error
@@ -92,7 +104,6 @@ class MyClient(discord.Client):
 
     async def get_voice_client(self, voice_channel):
         voice_client = self.voice_client.get(voice_channel.guild.id, None)
-        print(f"\n{voice_client}")
         if voice_client is None or not voice_client.is_connected():
             voice_client = (await voice_channel.connect())
             self.voice_client[voice_channel.guild.id] = voice_client
