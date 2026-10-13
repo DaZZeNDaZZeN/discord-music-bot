@@ -3,9 +3,12 @@ import os
 from collections import defaultdict, deque
 import yt_dlp
 
+MUSIC_FOLDER = "/home/ren/Music/"
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aac"}
+
 YDL_OPTS = {
     'outtmpl': '%(uploader)s - %(title)s[%(id)s].%(ext)s',
-    'paths': {'home': '/home/ren/Music/DiscordBot/'},
+    'paths': {'home': MUSIC_FOLDER},
     'format': 'bestaudio/best',
     'keepvideo': True,
     'default_search': 'ytsearch',
@@ -15,9 +18,6 @@ YDL_OPTS = {
         'preferredcodec': 'opus',
     }]
 }
-
-MUSIC_FOLDER = "/home/ren/Music/"
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aac"}
 
 class MyClient(discord.Client):
 
@@ -103,8 +103,8 @@ for example ```%play Theta.wav``` will play file Theta.wav from host pc
         if q.startswith("%skip"):
             voice_client = (await self.get_voice_client(voice_channel))
             voice_client.stop()
-            self.play_next_song_in_queue()
             await text_channel.send(f"Skipped: {self.now_playing.get(text_channel.guild.id, "None")}")
+            self.play_next_song_in_queue()
 
         if q.startswith("%queue"):
             command = q.removeprefix("%queue").strip()
