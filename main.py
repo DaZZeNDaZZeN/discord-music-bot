@@ -1,4 +1,5 @@
 import discord
+import os
 from collections import defaultdict, deque
 import yt_dlp
 
@@ -16,6 +17,7 @@ YDL_OPTS = {
 }
 
 MUSIC_FOLDER = "/home/ren/Music/"
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aac"}
 
 class MyClient(discord.Client):
 
@@ -43,15 +45,39 @@ class MyClient(discord.Client):
 
         q = message.content
 
-        if q.startswith("%play "):
+        if q.startswith("%playing"):
+            await text_channel.send(f"Now playing: {self.now_playing.get(text_channel.guild.id, "None")}")
+
+        if q.startswith("%play"):
+
+            path = q.removeprefix("%play").strip()
+
+            if path == "":
+                await text_channel.send("""Usage:
+
+play by name ```%play name_of_the_song```
+
+play by url(youtube) ```%play https://youtube.com/```
+
+if name of the song is ended with '.opus' '.mp3' or similar, it is treated as a path to a file on host pc
+for example ```%play Theta.wav``` will play file Theta.wav from host pc
+
+```%find name``` finds all local files that match name""")
+                return
+
             if voice_channel is None:
                 await text_channel.send("Please join a voice channel first!")
                 return
 
-            path = q.removeprefix("%play").strip()
+            is_local_file = False
+            for ext in AUDIO_EXTENSIONS:
+                if path.endswith(ext):
+                    path.removesuffix(ext).strip()
+                    is_local_file = True
+                    break
 
-            if path.startswith("local:"):
-                path = MUSIC_FOLDER + path.removeprefix("local:").strip()
+            if is_local_file:
+                path = MUSIC_FOLDER + path
             else:
                 with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
                     info = ydl.extract_info(path)
@@ -80,9 +106,6 @@ class MyClient(discord.Client):
             self.play_next_song_in_queue()
             await text_channel.send(f"Skipped: {self.now_playing.get(text_channel.guild.id, "None")}")
 
-        if q.startswith("%playing"):
-            await text_channel.send(f"Now playing: {self.now_playing.get(text_channel.guild.id, "None")}")
-
         if q.startswith("%queue"):
             command = q.removeprefix("%queue").strip()
             if command == "clear":
@@ -102,6 +125,61 @@ class MyClient(discord.Client):
                     await text_channel.send(msg)
                 else:
                     await text_channel.send("Queue is empty")
+
+        if q.startswith("%find"):
+            query = q.removeprefix("%find").strip().lower()
+            
+            if not query:
+                if text_channel:
+                    await text_channel.send("Usage: `%find <song or artist name>` --page n to specify page")
+                return
+
+            if not os.path.exists(MUSIC_FOLDER):
+                if text_channel:
+                    await text_channel.send(f"Directory `{MUSIC_FOLDER}` does not exist on host machine.")
+                return
+            query += "--page 1" # default page 1
+            query = query.split("--page")
+            page = query[1]
+            try:
+                page = int(page) - 1
+                if page < 0:
+                    page = 0
+            except:
+                if text_channel:
+                    await text_channel.send("Please specify a number after '--page' for example %find something --page 3")
+                return
+            query = query[0].strip()
+            matches = []
+            i = 1
+            for root, _, files in os.walk(MUSIC_FOLDER):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in AUDIO_EXTENSIONS and query in file.lower():
+                        path = os.path.join(root, file)
+                        matches.append(f"{i}. ```{path[len(MUSIC_FOLDER):]}```")
+                        i += 1
+
+            if not matches:
+                if text_channel:
+                    await text_channel.send(f"No audio files found matching `{query}`.")
+                return
+
+            # Display up to 15 results to avoid exceeding message length limits
+            MAX_DISPLAY = 15
+            displayed_matches = matches[MAX_DISPLAY * page:MAX_DISPLAY * (page + 1)]
+            
+            output = f"🔍 **Found {len(matches)} matching file(s):**\n\n"
+            output += "\n\n".join(displayed_matches)
+            
+            if len(matches) > MAX_DISPLAY * (page + 1):
+                output += f"\n\n... and {len(matches) - MAX_DISPLAY * (page + 1)} more result(s)."
+                output += f"\n\n please use ```%find {query} --page {page + 2}``` to see the rest"
+
+            if text_channel:
+                await text_channel.send(output)
+            return
+
 
     def play_next_song_in_queue(self, error=None):
         if error is not None:
