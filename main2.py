@@ -516,16 +516,13 @@ class PlayerView(_ViewBase):
                 )
 
     async def on_pause_resume(self, interaction):
+        await self.client._ack_interaction(interaction)
         vc = self.client.voice_client.get(self.guild_id)
         if vc is not None and getattr(vc, "is_playing", lambda: False)():
             vc.pause()
             state = self.client.playback_state.get(self.guild_id)
             if state is not None and state.get("pause_start") is None:
                 state["pause_start"] = time.monotonic()
-            self.sync_labels()
-            await self.client._respond_interaction(
-                interaction, self.client.t(self.guild_id, "paused")
-            )
             await self.refresh_player_message(interaction)
         elif vc is not None and getattr(vc, "is_paused", lambda: False)():
             vc.resume()
@@ -535,65 +532,47 @@ class PlayerView(_ViewBase):
                     time.monotonic() - state["pause_start"]
                 )
                 state["pause_start"] = None
-            self.sync_labels()
-            await self.client._respond_interaction(
-                interaction, self.client.t(self.guild_id, "resumed")
-            )
             await self.refresh_player_message(interaction)
-        else:
-            await self.client._respond_interaction(
-                interaction, self.client.t(self.guild_id, "nothing_playing")
-            )
 
     async def on_skip(self, interaction):
-        reply = await self.client.execute_skip(
-            self.guild_id, amount=1, recreate_player=True
-        )
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_skip(self.guild_id, amount=1, recreate_player=True)
 
     async def on_prev(self, interaction):
-        reply = await self.client.execute_prev(
-            self.guild_id, amount=1, recreate_player=True
-        )
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_prev(self.guild_id, amount=1, recreate_player=True)
 
     async def on_seek_back(self, interaction):
-        reply = await self.client.execute_seek(self.guild_id, -10.0)
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_seek(self.guild_id, -10.0)
 
     async def on_seek_fwd(self, interaction):
-        reply = await self.client.execute_seek(self.guild_id, 10.0)
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_seek(self.guild_id, 10.0)
 
     async def on_shuffle(self, interaction):
+        await self.client._ack_interaction(interaction)
         queue = self.client.queue[self.guild_id]
         if not queue:
-            await self.client._respond_interaction(
-                interaction, self.client.t(self.guild_id, "queue_empty")
-            )
             return
         items = list(queue)
         random.shuffle(items)
         queue.clear()
         queue.extend(items)
         self.client.trigger_background_downloads(self.guild_id)
-        await self.client._respond_interaction(
-            interaction, self.client.t(self.guild_id, "shuffled")
-        )
 
     async def on_queue(self, interaction):
-        queue_text = self.client.format_queue_page(self.guild_id, page=1)
-        await self.client._respond_interaction(interaction, queue_text)
+        await self.client._ack_interaction(interaction)
 
     async def on_cancel(self, interaction):
-        reply = await self.client.execute_cancel(self.guild_id, recreate_player=True)
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_cancel(self.guild_id, recreate_player=True)
 
     async def on_stop(self, interaction):
-        reply = await self.client.execute_skip(
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_skip(
             self.guild_id, amount=None, recreate_player=False
         )
-        await self.client._respond_interaction(interaction, reply)
 
     async def _adjust_volume(
         self,
@@ -601,6 +580,7 @@ class PlayerView(_ViewBase):
         delta: float | None = None,
         exact: float | None = None,
     ):
+        await self.client._ack_interaction(interaction)
         if exact is not None:
             new_pct = max(MIN_VOLUME_PERCENT, min(MAX_VOLUME_PERCENT, exact))
         else:
@@ -609,11 +589,7 @@ class PlayerView(_ViewBase):
                 MIN_VOLUME_PERCENT,
                 min(MAX_VOLUME_PERCENT, current_pct + (delta or 0.0)),
             )
-        applied = self.client.set_guild_volume(self.guild_id, new_pct)
-        display_pct = int(applied) if applied.is_integer() else applied
-        await self.client._respond_interaction(
-            interaction, self.client.t(self.guild_id, "vol_set", vol=display_pct)
-        )
+        self.client.set_guild_volume(self.guild_id, new_pct)
         await self.refresh_player_message(interaction)
 
     async def on_vol_down_25(self, interaction):
@@ -632,8 +608,8 @@ class PlayerView(_ViewBase):
         await self._adjust_volume(interaction, delta=25.0)
 
     async def on_leave(self, interaction):
-        reply = await self.client.execute_leave(self.guild_id)
-        await self.client._respond_interaction(interaction, reply)
+        await self.client._ack_interaction(interaction)
+        await self.client.execute_leave(self.guild_id)
 
 
 class MyClient(discord.Client):
@@ -1591,6 +1567,13 @@ class MyClient(discord.Client):
     def create_player_view(self, guild_id: int) -> PlayerView:
         return PlayerView(self, guild_id)
 
+    async def _delete_user_message(self, message):
+        if message is not None and hasattr(message, "delete"):
+            try:
+                await message.delete()
+            except Exception:
+                pass
+
     async def _delete_player_message(self, guild_id: int):
         old_msg = self.player_messages.pop(guild_id, None)
         if old_msg is not None and hasattr(old_msg, "delete"):
@@ -1698,21 +1681,16 @@ class MyClient(discord.Client):
             fallback_text=fallback_text,
         )
 
-    async def _respond_interaction(self, interaction, content: str):
+    async def _ack_interaction(self, interaction):
+        """Silently acknowledge button interaction without sending a message to the user."""
         resp = getattr(interaction, "response", None)
-        if resp is not None and hasattr(resp, "send_message"):
+        if resp is not None and hasattr(resp, "defer"):
             try:
                 if hasattr(resp, "is_done") and resp.is_done():
-                    followup = getattr(interaction, "followup", None)
-                    if followup is not None and hasattr(followup, "send"):
-                        return await followup.send(content, ephemeral=True)
-                return await resp.send_message(content, ephemeral=True)
-            except TypeError:
-                return await resp.send_message(content)
-        channel = getattr(interaction, "channel", None)
-        if channel is not None and hasattr(channel, "send"):
-            return await self._safe_send(channel, content)
-        return None
+                    return
+                await resp.defer()
+            except Exception:
+                pass
 
     async def handle_play_command(self, message, query: str, play_next: bool = False):
         text_channel = message.channel
@@ -1728,6 +1706,8 @@ class MyClient(discord.Client):
         if voice_channel is None:
             await text_channel.send(self.t(guild_id, "join_voice"))
             return
+
+        await self._delete_user_message(message)
 
         requester_name = (
             getattr(message.author, "display_name", None)
@@ -1899,26 +1879,27 @@ class MyClient(discord.Client):
                     )
                     return
 
+            # Always send/edit the song info card first
+            card_text, card_embed = self.build_added_to_queue_display(
+                guild_id,
+                first_item,
+                total_added=len(items_to_add),
+                play_next=play_next,
+            )
+            await self._send_or_edit(
+                text_channel,
+                status_msg,
+                None,
+                embed=card_embed,
+                view=None,
+                fallback_text=card_text,
+            )
+
             self.play(voice_client, first_item)
             if was_queue_empty_and_inactive:
-                await self._delete_player_message(guild_id)
-                fallback_text, embed = self.build_player_display(
-                    guild_id,
-                    first_item,
-                    extra_added_count=max(0, len(items_to_add) - 1),
-                )
-                player_view = self.create_player_view(guild_id)
-                sent = await self._send_or_edit(
-                    text_channel,
-                    status_msg,
-                    None,
-                    embed=embed,
-                    view=player_view,
-                    fallback_text=fallback_text,
-                )
-                self.player_messages[guild_id] = sent
+                await self.recreate_player_message(guild_id)
         else:
-            # Song was added to queue while already playing: do NOT create a new player here
+            # Song was added to queue while already playing: send song info card without creating player
             self.trigger_background_downloads(guild_id)
             primary_item = items_to_add[0]
             fallback_text, embed = self.build_added_to_queue_display(
@@ -2350,10 +2331,12 @@ class MyClient(discord.Client):
                 raw_target = raw_target.removeprefix("--page").strip()
 
             if not raw_target:
+                await self._delete_user_message(message)
                 await text_channel.send(self.format_help_page(guild_id, page=1))
                 return
 
             if raw_target.isdigit():
+                await self._delete_user_message(message)
                 await text_channel.send(
                     self.format_help_page(guild_id, page=int(raw_target))
                 )
@@ -2364,6 +2347,7 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "help_unknown", cmd=target))
                 return
 
+            await self._delete_user_message(message)
             info = help_table[target]
             await text_channel.send(f"**`{info['usage']}`**\n\n{info['long']}")
             return
@@ -2373,12 +2357,14 @@ class MyClient(discord.Client):
             if target_lang not in ("en", "ru"):
                 await text_channel.send(self.t(guild_id, "lang_usage"))
                 return
+            await self._delete_user_message(message)
             self.language[guild_id] = target_lang
             self.save_languages()
             await text_channel.send(self.t(guild_id, "lang_set"))
             return
 
         if cmd == "%playing":
+            await self._delete_user_message(message)
             current_item = self.now_playing_item.get(guild_id)
             voice_client = self.voice_client.get(guild_id)
             if current_item is None or not self.is_guild_active(voice_client):
@@ -2413,6 +2399,7 @@ class MyClient(discord.Client):
             return
 
         if cmd == "%cancel":
+            await self._delete_user_message(message)
             prev_current = self.now_playing_item.get(guild_id)
             reply = await self.execute_cancel(guild_id, recreate_player=False)
             await text_channel.send(reply)
@@ -2426,6 +2413,7 @@ class MyClient(discord.Client):
         if cmd == "%remove":
             rem_arg = arg.strip()
             if not rem_arg:
+                await self._delete_user_message(message)
                 reply = await self.execute_remove(
                     guild_id, amount=None, recreate_player=False
                 )
@@ -2444,6 +2432,7 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "remove_invalid"))
                 return
 
+            await self._delete_user_message(message)
             reply = await self.execute_remove(
                 guild_id, amount=amount, recreate_player=False
             )
@@ -2469,6 +2458,7 @@ class MyClient(discord.Client):
                     await text_channel.send(self.t(guild_id, "prev_invalid"))
                     return
 
+            await self._delete_user_message(message)
             reply = await self.execute_prev(
                 guild_id, amount=amount, recreate_player=False
             )
@@ -2487,11 +2477,13 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "seek_invalid"))
                 return
 
+            await self._delete_user_message(message)
             reply = await self.execute_seek(guild_id, seconds)
             await text_channel.send(reply)
             return
 
         if cmd == "%download":
+            await self._delete_user_message(message)
             queue = self.queue[guild_id]
             if not queue:
                 await text_channel.send(self.t(guild_id, "queue_empty"))
@@ -2564,6 +2556,7 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "find_usage"))
                 return
 
+            await self._delete_user_message(message)
             matched_files = find_matching_files(pattern, MUSIC_FOLDER)
             if not matched_files:
                 await text_channel.send(self.t(guild_id, "find_none", pattern=pattern))
@@ -2624,6 +2617,7 @@ class MyClient(discord.Client):
                     await text_channel.send(self.t(guild_id, "skip_invalid"))
                     return
 
+            await self._delete_user_message(message)
             reply = await self.execute_skip(
                 guild_id, amount=amount, recreate_player=False
             )
@@ -2635,6 +2629,7 @@ class MyClient(discord.Client):
         if cmd == "%queue":
             raw_arg = arg.strip()
             if raw_arg.lower() == "clear":
+                await self._delete_user_message(message)
                 self.queue[guild_id].clear()
                 self.trigger_background_downloads(guild_id)
                 await text_channel.send(self.t(guild_id, "queue_cleared"))
@@ -2653,6 +2648,7 @@ class MyClient(discord.Client):
             if page <= 0:
                 page = 1
 
+            await self._delete_user_message(message)
             msg = self.format_queue_page(guild_id, page=page)
             await text_channel.send(msg)
             return
@@ -2660,6 +2656,7 @@ class MyClient(discord.Client):
         if cmd == "%history":
             raw_arg = arg.strip()
             if raw_arg.lower() == "clear":
+                await self._delete_user_message(message)
                 self.history[guild_id].clear()
                 await text_channel.send(self.t(guild_id, "history_cleared"))
                 return
@@ -2677,11 +2674,13 @@ class MyClient(discord.Client):
             if page <= 0:
                 page = 1
 
+            await self._delete_user_message(message)
             msg = self.format_history_page(guild_id, page=page)
             await text_channel.send(msg)
             return
 
         if cmd == "%shuffle":
+            await self._delete_user_message(message)
             queue = self.queue[guild_id]
             if not queue:
                 await text_channel.send(self.t(guild_id, "queue_empty"))
@@ -2695,11 +2694,13 @@ class MyClient(discord.Client):
             return
 
         if cmd == "%leave":
+            await self._delete_user_message(message)
             reply = await self.execute_leave(guild_id)
             await text_channel.send(reply)
             return
 
         if cmd == "%pause":
+            await self._delete_user_message(message)
             voice_client = self.voice_client.get(guild_id)
             if (
                 voice_client is None
@@ -2715,6 +2716,7 @@ class MyClient(discord.Client):
             return
 
         if cmd == "%resume":
+            await self._delete_user_message(message)
             voice_client = self.voice_client.get(guild_id)
             if (
                 voice_client is None
@@ -2735,6 +2737,7 @@ class MyClient(discord.Client):
         if cmd in ("%vol", "%volume"):
             vol_str = arg.strip().removesuffix("%").strip()
             if not vol_str:
+                await self._delete_user_message(message)
                 current_vol = int(round(self.volume[guild_id] * 100))
                 await text_channel.send(
                     self.t(guild_id, "vol_current", vol=current_vol, cmd=cmd)
@@ -2752,6 +2755,7 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "vol_invalid", cmd=cmd))
                 return
 
+            await self._delete_user_message(message)
             applied = self.set_guild_volume(guild_id, percentage)
             display_pct = int(applied) if applied.is_integer() else applied
             await text_channel.send(self.t(guild_id, "vol_set", vol=display_pct))
@@ -2763,6 +2767,7 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "save_usage"))
                 return
 
+            await self._delete_user_message(message)
             if not playlist_name.lower().endswith(PLAYLIST_EXTENSION):
                 playlist_name += PLAYLIST_EXTENSION
 
