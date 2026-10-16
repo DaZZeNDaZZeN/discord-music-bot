@@ -1,0 +1,440 @@
+{
+  "COMMAND_HELP": {
+    "en": {
+      "play": {
+        "usage": "%play <name | url>",
+        "short": "Plays a song or playlist by local match, YouTube search, or URL.",
+        "long": "Searches the local music folder for `<name>`. If exactly 1 match is found (an audio file or `.playlist`), it is added to the queue. If 0 or multiple local matches are found, the bot searches YouTube, downloads the audio in `.opus` format, and adds it to the queue. If a direct song URL is provided, it downloads and queues the song. If a playlist URL is provided, all songs are queued while keeping the 5 leftmost URLs downloaded in the background. Creates the interactive player when starting playback on an empty queue.\n\n**Examples:**\n```%play Cool guy```\n```%play Theta.wav```\n```%play https://www.youtube.com/watch?v=dQw4w9WgXcQ```\n```%play https://www.youtube.com/playlist?list=PL123456789```"
+      },
+      "playnext": {
+        "usage": "%playnext <name | url>",
+        "short": "Same as %play, but inserts the song or playlist at the beginning of the queue.",
+        "long": "Works identically to `%play` (supporting local files, `.playlist` files, YouTube searches, song URLs, and playlist URLs), but places the matched song(s) at the very front of the queue so they play next.\n\n**Examples:**\n```%playnext Cool guy```\n```%playnext https://www.youtube.com/watch?v=dQw4w9WgXcQ```"
+      },
+      "cancel": {
+        "usage": "%cancel",
+        "short": "Removes all tracks from the latest %play across queue, history, and currently playing song.",
+        "long": "Removes all tracks that were added by the most recent `%play` (or `%playnext`) command from the current queue, playback history, and the currently playing song. Can be used multiple times in a row to undo earlier `%play` requests.\n\n**Examples:**\n```%cancel```"
+      },
+      "remove": {
+        "usage": "%remove [amount]",
+        "short": "Removes the current song (no arg), upcoming songs from queue (+amount), or songs from history (-amount).",
+        "long": "Without arguments (`%remove`), removes the currently playing song without adding it to history and advances the queue. With a positive `<amount>`, removes `<amount>` songs from the queue. With a negative `<amount>`, removes `<amount>` songs from playback history.\n\n**Examples:**\n```%remove```\n```%remove 3```\n```%remove -2```"
+      },
+      "skip": {
+        "usage": "%skip [amount | all]",
+        "short": "Skips the specified number of songs, or moves all queued songs to history and stops if 'all'.",
+        "long": "Skips the currently playing song and advances through the queue. If `[amount]` is omitted, skips 1 song. If `[amount]` is greater than the number of songs in the queue or is `all`, records the current song and all queued songs into history and stops playback.\n\n**Examples:**\n```%skip```\n```%skip 3```\n```%skip all```"
+      },
+      "prev": {
+        "usage": "%prev <amount>",
+        "short": "Adds the specified amount of previously played songs back to the front of the queue and plays the most previous song.",
+        "long": "Places the currently playing song (if any) back at the front of the queue, takes `<amount>` songs from the playback history, prepends them to the beginning of the queue, and immediately starts playing the most previous song.\n\n**Examples:**\n```%prev 1```\n```%prev 3```"
+      },
+      "find": {
+        "usage": "%find <pattern> [--page n]",
+        "short": "Searches the music folder for matching audio and .playlist files.",
+        "long": "Searches the local music directory for audio files (`.opus`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`, `.aac`) and `.playlist` files matching `<pattern>`. All words in `<pattern>` are matched case-insensitively against relative paths, or if `<pattern>` is an exact relative file path, only that file is matched. Supports pagination with `--page n`.\n\n**Examples:**\n```%find Cool guy```\n```%find Cool guy --page 2```\n```%find subdir/song.opus```"
+      },
+      "vol": {
+        "usage": "%vol <0-200> (or %volume <0-200>)",
+        "short": "Sets and saves the playback volume percentage (0% to 200%) for this server.",
+        "long": "Adjusts the playback volume to `<percentage>%` (capped between 0% and 200%) immediately and saves it on disk for this guild so the setting persists across bot restarts. Calling `%vol` without arguments displays the current volume.\n\n**Examples:**\n```%vol 50```\n```%volume 150%```\n```%vol```"
+      },
+      "volume": {
+        "usage": "%volume <0-200> (alias for %vol)",
+        "short": "Alias for %vol — sets and saves the playback volume percentage (0% to 200%).",
+        "long": "Alias for `%vol`. Adjusts the playback volume to `<percentage>%` (between 0% and 200%) immediately and saves it on disk for this guild.\n\n**Examples:**\n```%volume 75```\n```%vol 100```"
+      },
+      "seek": {
+        "usage": "%seek <seconds>",
+        "short": "Skips the specified number of seconds in the current song (negative to go backwards).",
+        "long": "Seeks forward or backward by `<seconds>` in the currently playing (or paused) track. Pass a positive number to skip ahead or a negative number to rewind.\n\n**Examples:**\n```%seek 15```\n```%seek -10```"
+      },
+      "queue": {
+        "usage": "%queue [page_number | clear]",
+        "short": "Displays paginated queue contents or clears the queue.",
+        "long": "Shows the current song queue (10 songs per page) along with a copyable command for the next page if more pages exist. Pass `clear` to empty the queue.\n\n**Examples:**\n```%queue```\n```%queue 2```\n```%queue clear```"
+      },
+      "history": {
+        "usage": "%history [page_number | clear]",
+        "short": "Shows a paginated list of songs that were played, like %queue.",
+        "long": "Displays the playback history (10 songs per page) along with a copyable command for the next page if more pages exist. Pass `clear` to empty the playback history.\n\n**Examples:**\n```%history```\n```%history 2```\n```%history clear```"
+      },
+      "shuffle": {
+        "usage": "%shuffle",
+        "short": "Shuffles the current queue in random order.",
+        "long": "Randomly reorders all songs currently waiting in the queue and updates background prefetching for the new 5 leftmost URLs.\n\n**Examples:**\n```%shuffle```"
+      },
+      "leave": {
+        "usage": "%leave",
+        "short": "Stops playback and leaves the voice channel.",
+        "long": "Stops any currently playing audio and disconnects the bot from the voice channel.\n\n**Examples:**\n```%leave```"
+      },
+      "playing": {
+        "usage": "%playing",
+        "short": "Shows the current song, author, requester, progress bar, and thumbnail.",
+        "long": "Displays formatted information about the currently playing (or paused) track, including song name, author, who added the song, a partially filled playback progress bar with timestamps, and the track thumbnail image.\n\n**Examples:**\n```%playing```"
+      },
+      "pause": {
+        "usage": "%pause",
+        "short": "Pauses playback and shows the command to resume.",
+        "long": "Pauses the currently playing track and sends a confirmation message with the copyable `%resume` command.\n\n**Examples:**\n```%pause```"
+      },
+      "resume": {
+        "usage": "%resume",
+        "short": "Resumes paused music playback.",
+        "long": "Resumes playback of a paused track from the exact position where it was paused.\n\n**Examples:**\n```%resume```"
+      },
+      "save": {
+        "usage": "%save <name>",
+        "short": "Saves the currently playing song and queue to a .playlist file.",
+        "long": "Saves the currently playing song followed by all queued items into `<name>.playlist` (JSON format) inside the music folder so it can be played later with `%play <name>`.\n\n**Examples:**\n```%save favorites```\n```%save chill.playlist```"
+      },
+      "download": {
+        "usage": "%download",
+        "short": "Downloads all queued URLs and replaces them in the queue with local paths.",
+        "long": "Downloads every remaining URL item in the queue to `.opus` files on disk and replaces all URLs in the queue with their local file paths. Reports if an error stops the download.\n\n**Examples:**\n```%download```"
+      },
+      "lang": {
+        "usage": "%lang <en|ru>",
+        "short": "Changes the bot language in this server to English (en) or Russian (ru).",
+        "long": "Switches all bot responses, interactive buttons, and help descriptions in this guild between English (`en`) and Russian (`ru`), and saves the preference on disk.\n\n**Examples:**\n```%lang en```\n```%lang ru```"
+      },
+      "help": {
+        "usage": "%help [page | command]",
+        "short": "Lists commands by page (1 or 2) or shows detailed help for a specific command.",
+        "long": "Without arguments (or with a page number `1` or `2`), lists available bot commands with short descriptions. When given a command name, displays its full explanation and usage examples.\n\n**Examples:**\n```%help```\n```%help 2```\n```%help play```\n```%help %find```"
+      }
+    },
+    "ru": {
+      "play": {
+        "usage": "%play <название | ссылка>",
+        "short": "Воспроизводит песню или плейлист из папки, поиска YouTube или по ссылке.",
+        "long": "Ищет `<название>` в локальной папке с музыкой. Если найдено ровно 1 совпадение (аудиофайл или `.playlist`), добавляет его в очередь. Если совпадений нет или их несколько — ищет песню на YouTube, скачивает в формате `.opus` и добавляет в очередь. Если передана ссылка на песню — скачивает её; если ссылка на плейлист — добавляет все песни в очередь и держит 5 первых ссылок в очереди предзагруженными в фоне. Создаёт интерактивный плеер, если очередь была пуста.\n\n**Примеры:**\n```%play Cool guy```\n```%play Theta.wav```\n```%play https://www.youtube.com/watch?v=dQw4w9WgXcQ```\n```%play https://www.youtube.com/playlist?list=PL123456789```"
+      },
+      "playnext": {
+        "usage": "%playnext <название | ссылка>",
+        "short": "То же, что %play, но добавляет песню или плейлист в начало очереди.",
+        "long": "Работает аналогично `%play` (поддерживает локальные файлы, `.playlist`, поиск на YouTube, ссылки на треки и плейлисты), но помещает песни в самое начало очереди.\n\n**Примеры:**\n```%playnext Cool guy```\n```%playnext https://www.youtube.com/watch?v=dQw4w9WgXcQ```"
+      },
+      "cancel": {
+        "usage": "%cancel",
+        "short": "Удаляет треки из последнего %play из очереди, истории и текущего трека.",
+        "long": "Удаляет все треки, добавленные последним запросом `%play` (или `%playnext`), из текущей очереди, истории воспроизведения и текущего проигрываемого трека. Можно вызывать несколько раз подряд для отмены предыдущих запросов `%play`.\n\n**Примеры:**\n```%cancel```"
+      },
+      "remove": {
+        "usage": "%remove [количество]",
+        "short": "Удаляет текущую песню (без аргумента), из очереди (+число) или из истории (-число).",
+        "long": "Без аргументов (`%remove`) удаляет текущую играющую песню без сохранения в историю и переключает на следующую. С положительным числом удаляет указанное количество песен из очереди. С отрицательным числом удаляет указанное количество песен из истории воспроизведения.\n\n**Примеры:**\n```%remove```\n```%remove 3```\n```%remove -2```"
+      },
+      "skip": {
+        "usage": "%skip [количество | all]",
+        "short": "Пропускает указанное число песен или переносит очередь в историю при 'all'.",
+        "long": "Пропускает текущую песню и переходит к следующей в очереди. Если аргумент не указан — пропускает 1 песню. Если число больше длины очереди или указано `all` — переносит текущую песню и все песни из очереди в историю и останавливает воспроизведение.\n\n**Примеры:**\n```%skip```\n```%skip 3```\n```%skip all```"
+      },
+      "prev": {
+        "usage": "%prev <количество>",
+        "short": "Возвращает сыгранные песни из истории в начало очереди и включает предыдущую.",
+        "long": "Помещает текущую играющую песню в начало очереди, берёт `<количество>` уже проигранных песен из истории воспроизведения, добавляет их в начало очереди и сразу запускает воспроизведение самой предыдущей песни.\n\n**Примеры:**\n```%prev 1```\n```%prev 3```"
+      },
+      "find": {
+        "usage": "%find <шаблон> [--page n]",
+        "short": "Ищет аудиофайлы и плейлисты .playlist в музыкальной папке по шаблону.",
+        "long": "Ищет в папке с музыкой аудиофайлы (`.opus`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`, `.aac`) и плейлисты `.playlist`, соответствующие `<шаблону>`. Все слова шаблона ищутся без учёта регистра в относительном пути файла; если указан точный относительный путь — возвращается только этот файл. Поддерживает пагинацию через `--page n`.\n\n**Примеры:**\n```%find Cool guy```\n```%find Cool guy --page 2```\n```%find subdir/song.opus```"
+      },
+      "vol": {
+        "usage": "%vol <0-200> (или %volume <0-200>)",
+        "short": "Изменяет и сохраняет громкость музыки на сервере (от 0% до 200%).",
+        "long": "Устанавливает громкость воспроизведения на `<процент>%` (в диапазоне от 0% до 200%) и сохраняет её на диске для текущего сервера, чтобы настройка сохранялась после перезапуска бота. Вызов `%vol` без аргументов показывает текущую громкость.\n\n**Примеры:**\n```%vol 50```\n```%volume 150%```\n```%vol```"
+      },
+      "volume": {
+        "usage": "%volume <0-200> (синоним %vol)",
+        "short": "Синоним %vol — изменяет и сохраняет громкость музыки (от 0% до 200%).",
+        "long": "Синоним команды `%vol`. Изменяет громкость музыки на `<процент>%` (от 0% до 200%) и сохраняет настройку на диске.\n\n**Примеры:**\n```%volume 75```\n```%vol 100```"
+      },
+      "seek": {
+        "usage": "%seek <секунды>",
+        "short": "Перематывает текущую песню на указанное число секунд (отрицательное — назад).",
+        "long": "Перематывает текущий трек вперёд или назад на `<секунды>`. Положительное число перематывает вперёд, отрицательное — назад.\n\n**Примеры:**\n```%seek 15```\n```%seek -10```"
+      },
+      "queue": {
+        "usage": "%queue [номер_страницы | clear]",
+        "short": "Показывает содержимое очереди по страницам или очищает очередь.",
+        "long": "Отображает текущую очередь воспроизведения (по 10 песен на странице) и команду для перехода на следующую страницу. Аргумент `clear` полностью очищает очередь.\n\n**Примеры:**\n```%queue```\n```%queue 2```\n```%queue clear```"
+      },
+      "history": {
+        "usage": "%history [номер_страницы | clear]",
+        "short": "Показывает список ранее сыгранных песен по страницам, как %queue.",
+        "long": "Отображает историю воспроизведённых песен (по 10 песен на странице) и команду для перехода на следующую страницу. Аргумент `clear` очищает историю.\n\n**Примеры:**\n```%history```\n```%history 2```\n```%history clear```"
+      },
+      "shuffle": {
+        "usage": "%shuffle",
+        "short": "Перемешивает очередь в случайном порядке.",
+        "long": "Перемешивает все песни в очереди в случайном порядке и обновляет фоновую предзагрузку для первых 5 ссылок.\n\n**Примеры:**\n```%shuffle```"
+      },
+      "leave": {
+        "usage": "%leave",
+        "short": "Останавливает воспроизведение и выходит из голосового канала.",
+        "long": "Останавливает текущую музыку и отключает бота от голосового канала.\n\n**Примеры:**\n```%leave```"
+      },
+      "playing": {
+        "usage": "%playing",
+        "short": "Показывает название песни, автора, кто добавил, прогресс и обложку.",
+        "long": "Показывает красиво оформленную информацию о текущем треке: название песни, автора, пользователя, добавившего трек, частично заполненную полосу прогресса воспроизведения и изображение обложки.\n\n**Примеры:**\n```%playing```"
+      },
+      "pause": {
+        "usage": "%pause",
+        "short": "Ставит музыку на паузу и выводит команду для продолжения.",
+        "long": "Приостанавливает воспроизведение текущего трека и отправляет сообщение с командой `%resume`.\n\n**Примеры:**\n```%pause```"
+      },
+      "resume": {
+        "usage": "%resume",
+        "short": "Возобновляет воспроизведение музыки после паузы.",
+        "long": "Продолжает воспроизведение приостановленного трека с того же места.\n\n**Примеры:**\n```%resume```"
+      },
+      "save": {
+        "usage": "%save <название>",
+        "short": "Сохраняет текущую песню и очередь в файл плейлиста .playlist.",
+        "long": "Сохраняет текущую воспроизводимую песню и всю очередь в JSON-файл `<название>.playlist` в музыкальной папке.\n\n**Примеры:**\n```%save favorites```\n```%save chill.playlist```"
+      },
+      "download": {
+        "usage": "%download",
+        "short": "Скачивает все песни из очереди и заменяет ссылки на локальные пути.",
+        "long": "Скачивает все оставшиеся ссылки в очереди в формат `.opus` и заменяет ссылки в очереди на локальные пути к файлам. В случае ошибки сообщает, сколько песен удалось скачать и на какой произошла ошибка.\n\n**Примеры:**\n```%download```"
+      },
+      "lang": {
+        "usage": "%lang <en|ru>",
+        "short": "Меняет язык бота на сервере на английский (en) или русский (ru).",
+        "long": "Переключает язык сообщений, кнопок плеера и справки бота на сервере между английским (`en`) и русским (`ru`) с сохранением на диске.\n\n**Примеры:**\n```%lang en```\n```%lang ru```"
+      },
+      "help": {
+        "usage": "%help [страница | команда]",
+        "short": "Показывает список команд по страницам (1 или 2) или справку по команде.",
+        "long": "Без аргументов (или с номером страницы `1` или `2`) выводит список доступных команд с кратким описанием. Если указано имя команды — выводит подробное описание и примеры.\n\n**Примеры:**\n```%help```\n```%help 2```\n```%help play```\n```%help %find```"
+      }
+    }
+  },
+  "MESSAGES": {
+    "en": {
+      "play_usage": "🎵 **Usage:**\n\nPlay by name:\n```{cmd_name} name_of_the_song```\n\nPlay by URL (YouTube):\n```{cmd_name} https://youtube.com/watch?v=...```\n\nIf the song name ends with `.opus`, `.mp3`, or similar, it is treated as a local file path on the host machine:\n```{cmd_name} Theta.wav```\n\nUse ```%find name``` to search for local files matching `name`.",
+      "join_voice": "Please join a voice channel first!",
+      "searching": "🔎 **Searching for song:** `{query}`...\n⏳ *Fetching metadata and preparing audio...*",
+      "searching_generic": "🔎 **Searching for song...**\n⏳ *Fetching metadata and preparing audio...*",
+      "play_error": "❌ **Failed to download or load song** `{query}`.\n**Reason:** `{err}`",
+      "no_playable": "No playable songs found.",
+      "unknown_author": "Unknown Artist",
+      "unknown_user": "Unknown User",
+      "unknown_duration": "Unknown",
+      "none_playing": "None",
+      "pos_front": "beginning of queue",
+      "pos_end": "queue",
+      "playing_single": "🎶 **Now Playing:** **{name}**\n👤 **Author:** {author}\n🙋 **Added by:** {added_by}\n⏱️ **Duration:** {duration}",
+      "playing_multi": "🎶 **Now Playing:** **{name}**\n👤 **Author:** {author}\n🙋 **Added by:** {added_by}\n⏱️ **Duration:** {duration}\n➕ **And {count} more tracks were added to queue**",
+      "added_single": "✅ **Added to {pos}:** **{name}**\n👤 **Author:** {author}\n🙋 **Added by:** {added_by}\n⏱️ **Duration:** {duration}",
+      "added_multi": "✅ **Added to {pos}:** **{name}**\n👤 **Author:** {author}\n🙋 **Added by:** {added_by}\n⏱️ **Duration:** {duration}\n➕ **And {count} more tracks were added to queue**",
+      "more_tracks_added": "➕ And {count} more tracks were added to queue",
+      "player_embed_title": "🎛️ Interactive Music Player",
+      "added_embed_title": "✅ Added to Queue",
+      "added_next_embed_title": "✅ Added to Beginning of Queue",
+      "playing_embed_title": "🎶 Now Playing",
+      "field_song": "🎵 Song",
+      "field_author": "👤 Author",
+      "field_added_by": "🙋 Added by",
+      "field_duration": "⏱️ Duration",
+      "field_progress": "📊 Playback Progress",
+      "field_status": "📡 Status",
+      "field_volume": "🔊 Volume",
+      "field_extra_tracks": "📥 Queue Update",
+      "now_playing_none": "Now playing: {name}",
+      "status_paused": "⏸️ Paused",
+      "status_playing": "▶️ Playing",
+      "now_playing_info": "🎶 **Now Playing:** **{title}** ({status})\n👤 **Author:** {author}\n🙋 **Added by:** {added_by}\n📊 **Playback:** `{bar}` `{elapsed} / {duration}`",
+      "queue_empty": "Queue is empty",
+      "queue_header": "📋 **Queue — Page {page}/{total_pages} ({total} track(s)):**\n",
+      "queue_cleared": "Queue is cleared",
+      "queue_usage": "Usage: `%queue [page_number]`",
+      "queue_next": "Use ```%queue {next_page}``` to see the next page",
+      "history_empty": "History is empty",
+      "history_header": "📜 **History — Page {page}/{total_pages} ({total} track(s)):**\n",
+      "history_cleared": "History is cleared",
+      "history_usage": "Usage: `%history [page_number]`",
+      "history_next": "Use ```%history {next_page}``` to see the next page",
+      "started_download": "⏳ Started downloading queued songs...",
+      "download_error": "Download stopped due to an error after downloading {count} song(s). Failed on song #{idx} (`{song}`): {err}",
+      "download_done": "Downloaded all {count} song(s) in queue and replaced URLs with local paths.",
+      "find_usage": "Usage: `%find <song or artist name>` --page n to specify page",
+      "dir_missing": "Directory `{folder}` does not exist on host machine.",
+      "find_page_err": "Please specify a number after '--page' for example %find something --page 3",
+      "find_none": "No audio files found matching `{pattern}`.",
+      "find_header": "🔍 **Found {total} matching file(s) (Page {page}/{pages}):**\n\n",
+      "find_more": "\n\n... and {remaining} more result(s).\n\nPlease use ```%find {pattern} --page {next_page}``` to see the rest",
+      "skip_pos_err": "Please specify a positive number of songs to skip or `all`.",
+      "skip_invalid": "Invalid skip amount. Usage: `%skip [amount|all]`",
+      "skip_cleared": "Cleared queue and stopped playing.",
+      "skipped_n": "Skipped {amount} song(s) (was playing: {current})",
+      "cancel_empty": "Nothing to cancel from previous `%play` requests.",
+      "cancel_done": "↩️ Cancelled `%play` request — removed {count} track(s) (queue: {queue_count}, history: {history_count}, current: {current_count}).",
+      "remove_usage": "Usage: `%remove [amount]` (no arg removes current song, positive removes from queue, negative removes from history)",
+      "remove_zero_err": "Please specify a non-zero number of songs to remove, or omit the argument to remove the current song.",
+      "remove_invalid": "Invalid amount. Usage: `%remove [amount]`",
+      "removed_current": "🗑️ Removed current song: **{name}**.",
+      "removed_n": "🗑️ Removed {count} song(s) from queue.",
+      "removed_history_n": "🗑️ Removed {count} song(s) from history.",
+      "prev_empty": "No previously played songs in history.",
+      "prev_pos_err": "Please specify a positive number of songs for `%prev`.",
+      "prev_invalid": "Invalid amount. Usage: `%prev <amount>`",
+      "prev_played": "⏮️ Added {amount} previously played song(s) back to the beginning of queue. Now playing: **{name}**",
+      "seek_usage": "Usage: `%seek <seconds>` (can be negative to seek backwards, e.g. `%seek -10`)",
+      "seek_invalid": "Invalid seconds value. Usage: `%seek <seconds>`",
+      "seeked_to": "⏩ Seeked {delta}s — current position: `{elapsed} / {duration}`",
+      "shuffled": "Queue shuffled.",
+      "not_in_voice": "Bot is not in a voice channel.",
+      "left_voice": "Left voice channel.",
+      "nothing_playing": "Nothing is currently playing.",
+      "paused": "Music paused. Use ```%resume``` to resume it.",
+      "not_paused": "Music is not paused.",
+      "resumed": "Music resumed.",
+      "vol_current": "Current volume: {vol}%. Usage: `{cmd} <0-200>`",
+      "vol_neg": "Volume percentage cannot be negative (must be between 0% and 200%).",
+      "vol_max": "Volume percentage cannot exceed 200% (must be between 0% and 200%).",
+      "vol_invalid": "Invalid percentage. Usage: `{cmd} <0-200>`",
+      "vol_set": "Volume set to {vol}%.",
+      "save_usage": "Usage: `%save <name>`",
+      "save_empty": "Nothing is playing and queue is empty.",
+      "saved_playlist": "Saved {count} song(s) to playlist `{name}`.",
+      "lang_usage": "Usage: `%lang <en|ru>`",
+      "lang_set": "Language set to English (`en`).",
+      "help_header": "📖 **Available Commands (Page {page}/{total_pages}):**\n",
+      "help_footer": "\nUse `%help <command>` for detailed info and examples.",
+      "help_next": "\nUse ```%help {next_page}``` to see the next page",
+      "help_unknown": "Unknown command `{cmd}`. Use `%help` to see all available commands.",
+      "btn_prev": "⏮️ Prev",
+      "btn_seek_back": "⏪ -10s",
+      "btn_pause": "⏸️ Pause",
+      "btn_resume": "▶️ Resume",
+      "btn_seek_fwd": "⏩ +10s",
+      "btn_skip": "⏭️ Skip",
+      "btn_shuffle": "🔀 Shuffle",
+      "btn_queue": "📋 Queue",
+      "btn_cancel": "↩️ Cancel",
+      "btn_stop": "⏹️ Stop",
+      "btn_leave": "🚪 Leave",
+      "btn_vol_down_25": "🔉 -25%",
+      "btn_vol_down": "🔉 -10%",
+      "btn_vol_reset": "🔊 100%",
+      "btn_vol_up": "🔊 +10%",
+      "btn_vol_up_25": "🔊 +25%"
+    },
+    "ru": {
+      "play_usage": "🎵 **Использование:**\n\nВоспроизвести по названию:\n```{cmd_name} название_песни```\n\nВоспроизвести по ссылке (YouTube):\n```{cmd_name} https://youtube.com/watch?v=...```\n\nЕсли название заканчивается на `.opus`, `.mp3` и т.п., оно обрабатывается как путь к локальному файлу на хост-компьютере:\n```{cmd_name} Theta.wav```\n\nКоманда ```%find название``` ищет все локальные файлы, совпадающие с `название`.",
+      "join_voice": "Пожалуйста, сначала зайдите в голосовой канал!",
+      "searching": "🔎 **Поиск песни:** `{query}`...\n⏳ *Получение метаданных и подготовка аудио...*",
+      "searching_generic": "🔎 **Поиск песни...**\n⏳ *Получение метаданных и подготовка аудио...*",
+      "play_error": "❌ **Не удалось скачать или загрузить песню** `{query}`.\n**Причина:** `{err}`",
+      "no_playable": "Не найдено доступных для воспроизведения песен.",
+      "unknown_author": "Неизвестный исполнитель",
+      "unknown_user": "Неизвестный пользователь",
+      "unknown_duration": "Неизвестно",
+      "none_playing": "Ничего",
+      "pos_front": "начало очереди",
+      "pos_end": "очередь",
+      "playing_single": "🎶 **Сейчас играет:** **{name}**\n👤 **Автор:** {author}\n🙋 **Добавил(а):** {added_by}\n⏱️ **Длительность:** {duration}",
+      "playing_multi": "🎶 **Сейчас играет:** **{name}**\n👤 **Автор:** {author}\n🙋 **Добавил(а):** {added_by}\n⏱️ **Длительность:** {duration}\n➕ **И ещё {count} трек(ов) добавлено в очередь**",
+      "added_single": "✅ **Добавлено в {pos}:** **{name}**\n👤 **Автор:** {author}\n🙋 **Добавил(а):** {added_by}\n⏱️ **Длительность:** {duration}",
+      "added_multi": "✅ **Добавлено в {pos}:** **{name}**\n👤 **Автор:** {author}\n🙋 **Добавил(а):** {added_by}\n⏱️ **Длительность:** {duration}\n➕ **И ещё {count} трек(ов) добавлено в очередь**",
+      "more_tracks_added": "➕ И ещё {count} трек(ов) добавлено в очередь",
+      "player_embed_title": "🎛️ Интерактивный музыкальный плеер",
+      "added_embed_title": "✅ Добавлено в очередь",
+      "added_next_embed_title": "✅ Добавлено в начало очереди",
+      "playing_embed_title": "🎶 Сейчас играет",
+      "field_song": "🎵 Песня",
+      "field_author": "👤 Автор",
+      "field_added_by": "🙋 Добавил(а)",
+      "field_duration": "⏱️ Длительность",
+      "field_progress": "📊 Прогресс воспроизведения",
+      "field_status": "📡 Статус",
+      "field_volume": "🔊 Громкость",
+      "field_extra_tracks": "📥 Очередь",
+      "now_playing_none": "Сейчас играет: {name}",
+      "status_paused": "⏸️ Пауза",
+      "status_playing": "▶️ Играет",
+      "now_playing_info": "🎶 **Сейчас играет:** **{title}** ({status})\n👤 **Автор:** {author}\n🙋 **Добавил(а):** {added_by}\n📊 **Прогресс:** `{bar}` `{elapsed} / {duration}`",
+      "queue_empty": "Очередь пуста",
+      "queue_header": "📋 **Очередь — Страница {page}/{total_pages} (всего: {total}):**\n",
+      "queue_cleared": "Очередь очищена",
+      "queue_usage": "Использование: `%queue [номер_страницы]`",
+      "queue_next": "Используйте ```%queue {next_page}``` для следующей страницы",
+      "history_empty": "История пуста",
+      "history_header": "📜 **История — Страница {page}/{total_pages} (всего: {total}):**\n",
+      "history_cleared": "История очищена",
+      "history_usage": "Использование: `%history [номер_страницы]`",
+      "history_next": "Используйте ```%history {next_page}``` для следующей страницы",
+      "started_download": "⏳ Начата загрузка треков из очереди...",
+      "download_error": "Загрузка остановлена из-за ошибки после скачивания {count} песен(и). Ошибка на песне #{idx} (`{song}`): {err}",
+      "download_done": "Скачано {count} песен(и) из очереди, все ссылки заменены на локальные пути.",
+      "find_usage": "Использование: `%find <название песни или исполнителя>` --page n для выбора страницы",
+      "dir_missing": "Директория `{folder}` не существует на хост-машине.",
+      "find_page_err": "Пожалуйста, укажите число после '--page', например %find something --page 3",
+      "find_none": "Аудиофайлы по запросу `{pattern}` не найдены.",
+      "find_header": "🔍 **Найдено совпадающих файлов: {total} (Страница {page}/{pages}):**\n\n",
+      "find_more": "\n\n... и ещё {remaining} результат(ов).\n\nИспользуйте ```%find {pattern} --page {next_page}``` для просмотра остальных",
+      "skip_pos_err": "Пожалуйста, укажите положительное число песен для пропуска или `all`.",
+      "skip_invalid": "Некорректное количество. Использование: `%skip [количество|all]`",
+      "skip_cleared": "Очередь очищена и воспроизведение остановлено.",
+      "skipped_n": "Пропущено песен: {amount} (играло: {current})",
+      "cancel_empty": "Нет треков для отмены предыдущих запросов `%play`.",
+      "cancel_done": "↩️ Отменён запрос `%play` — удалено треков: {count} (из очереди: {queue_count}, из истории: {history_count}, текущий: {current_count}).",
+      "remove_usage": "Использование: `%remove [количество]` (без аргумента — удалить текущую песню, положительное — из очереди, отрицательное — из истории)",
+      "remove_zero_err": "Пожалуйста, укажите ненулевое число песен или вызовите `%remove` без аргументов для удаления текущей песни.",
+      "remove_invalid": "Некорректное количество. Использование: `%remove [количество]`",
+      "removed_current": "🗑️ Удалена текущая песня: **{name}**.",
+      "removed_n": "🗑️ Удалено песен из очереди: {count}.",
+      "removed_history_n": "🗑️ Удалено песен из истории: {count}.",
+      "prev_empty": "В истории нет ранее проигранных песен.",
+      "prev_pos_err": "Пожалуйста, укажите положительное число песен для `%prev`.",
+      "prev_invalid": "Некорректное количество. Использование: `%prev <количество>`",
+      "prev_played": "⏮️ Возвращено {amount} ранее сыгранных песен(и) в начало очереди. Сейчас играет: **{name}**",
+      "seek_usage": "Использование: `%seek <секунды>` (можно указать отрицательное число для перемотки назад, например `%seek -10`)",
+      "seek_invalid": "Некорректное количество секунд. Использование: `%seek <секунды>`",
+      "seeked_to": "⏩ Перемотка на {delta}с — текущая позиция: `{elapsed} / {duration}`",
+      "shuffled": "Очередь перемешана.",
+      "not_in_voice": "Бот не находится в голосовом канале.",
+      "left_voice": "Бот покинул голосовой канал.",
+      "nothing_playing": "Сейчас ничего не играет.",
+      "paused": "Музыка на паузе. Используйте ```%resume``` для продолжения.",
+      "not_paused": "Музыка не стоит на паузе.",
+      "resumed": "Воспроизведение возобновлено.",
+      "vol_current": "Текущая громкость: {vol}%. Использование: `{cmd} <0-200>`",
+      "vol_neg": "Громкость не может быть отрицательной (должна быть от 0% до 200%).",
+      "vol_max": "Громкость не может превышать 200% (должна быть от 0% до 200%).",
+      "vol_invalid": "Некорректный процент. Использование: `{cmd} <0-200>`",
+      "vol_set": "Громкость установлена на {vol}%.",
+      "save_usage": "Использование: `%save <name>`",
+      "save_empty": "Сейчас ничего не играет и очередь пуста.",
+      "saved_playlist": "Сохранено {count} песен(и) в плейлист `{name}`.",
+      "lang_usage": "Использование: `%lang <en|ru>`",
+      "lang_set": "Язык бота изменён на русский (`ru`).",
+      "help_header": "📖 **Список доступных команд (Страница {page}/{total_pages}):**\n",
+      "help_footer": "\nИспользуйте `%help <команда>` для подробного описания и примеров.",
+      "help_next": "\nИспользуйте ```%help {next_page}``` для следующей страницы",
+      "help_unknown": "Неизвестная команда `{cmd}`. Используйте `%help` для просмотра всех команд.",
+      "btn_prev": "⏮️ Назад",
+      "btn_seek_back": "⏪ -10с",
+      "btn_pause": "⏸️ Пауза",
+      "btn_resume": "▶️ Старт",
+      "btn_seek_fwd": "⏩ +10с",
+      "btn_skip": "⏭️ Пропуск",
+      "btn_shuffle": "🔀 Смешать",
+      "btn_queue": "📋 Очередь",
+      "btn_cancel": "↩️ Отмена",
+      "btn_stop": "⏹️ Стоп",
+      "btn_leave": "🚪 Выйти",
+      "btn_vol_down_25": "🔉 -25%",
+      "btn_vol_down": "🔉 -10%",
+      "btn_vol_reset": "🔊 100%",
+      "btn_vol_up": "🔊 +10%",
+      "btn_vol_up_25": "🔊 +25%"
+    }
+  }
+}

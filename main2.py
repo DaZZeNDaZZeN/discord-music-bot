@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 import json
 import os
 import random
+import re
 import subprocess
 import time
 from urllib.parse import urlparse
@@ -14,11 +15,25 @@ MUSIC_FOLDER = "/home/ren/Music/"
 URL_MAP_FILENAME = "url_map.json"
 VOLUME_MAP_FILENAME = "volumes.json"
 LANG_MAP_FILENAME = "languages.json"
+LANG_DATA_FILENAME = "lang.json"
 MAX_MUSIC_FOLDER_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB
+MIN_VOLUME_PERCENT = 0.0
+MAX_VOLUME_PERCENT = 200.0
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aac"}
 PLAYLIST_EXTENSION = ".playlist"
 SEARCHABLE_EXTENSIONS = AUDIO_EXTENSIONS | {PLAYLIST_EXTENSION}
 PREFETCH_URL_COUNT = 5
+PROGRESS_BAR_LENGTH = 16
+HELP_PAGE_1_COMMANDS = (
+    "play",
+    "playnext",
+    "cancel",
+    "remove",
+    "skip",
+    "prev",
+    "find",
+    "vol",
+)
 
 YDL_OPTS = {
     "outtmpl": "%(uploader)s - %(title)s[%(id)s].%(ext)s",
@@ -43,482 +58,31 @@ YDL_FLAT_PLAYLIST_OPTS = {
     "no_warnings": True,
 }
 
-COMMAND_HELP = {
-    "en": {
-        "play": {
-            "usage": "%play <name | url>",
-            "short": "Plays a song or playlist by local match, YouTube search, or URL.",
-            "long": (
-                "Searches the local music folder for `<name>`. If exactly 1 match is found (an audio file or `.playlist`), "
-                "it is added to the queue. If 0 or multiple local matches are found, the bot searches YouTube, downloads "
-                "the audio in `.opus` format, and adds it to the queue. If a direct song URL is provided, it downloads and "
-                "queues the song. If a playlist URL is provided, all songs are queued while keeping the 5 leftmost URLs "
-                "downloaded in the background.\n\n"
-                "**Examples:**\n"
-                "```%play Cool guy```\n"
-                "```%play Theta.wav```\n"
-                "```%play https://www.youtube.com/watch?v=dQw4w9WgXcQ```\n"
-                "```%play https://www.youtube.com/playlist?list=PL123456789```"
-            ),
-        },
-        "playnext": {
-            "usage": "%playnext <name | url>",
-            "short": "Same as %play, but inserts the song or playlist at the beginning of the queue.",
-            "long": (
-                "Works identically to `%play` (supporting local files, `.playlist` files, YouTube searches, song URLs, "
-                "and playlist URLs), but places the matched song(s) at the very front of the queue so they play next.\n\n"
-                "**Examples:**\n"
-                "```%playnext Cool guy```\n"
-                "```%playnext https://www.youtube.com/watch?v=dQw4w9WgXcQ```"
-            ),
-        },
-        "find": {
-            "usage": "%find <pattern> [--page n]",
-            "short": "Searches the music folder for matching audio and .playlist files.",
-            "long": (
-                "Searches the local music directory for audio files (`.opus`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`, `.aac`) "
-                "and `.playlist` files matching `<pattern>`. All words in `<pattern>` are matched case-insensitively against "
-                "relative paths, or if `<pattern>` is an exact relative file path, only that file is matched. Supports pagination "
-                "with `--page n`.\n\n"
-                "**Examples:**\n"
-                "```%find Cool guy```\n"
-                "```%find Cool guy --page 2```\n"
-                "```%find subdir/song.opus```"
-            ),
-        },
-        "skip": {
-            "usage": "%skip [amount | all]",
-            "short": "Skips the specified number of songs, or clears the queue and stops if 'all'.",
-            "long": (
-                "Skips the currently playing song and advances through the queue. If `[amount]` is omitted, skips 1 song. "
-                "If `[amount]` is greater than the number of songs in the queue or is `all`, clears the entire queue and stops playback.\n\n"
-                "**Examples:**\n"
-                "```%skip```\n"
-                "```%skip 3```\n"
-                "```%skip all```"
-            ),
-        },
-        "queue": {
-            "usage": "%queue [page_number | clear]",
-            "short": "Displays paginated queue contents or clears the queue.",
-            "long": (
-                "Shows the current song queue (10 songs per page) along with a copyable command for the next page if more "
-                "pages exist. Pass `clear` to empty the queue.\n\n"
-                "**Examples:**\n"
-                "```%queue```\n"
-                "```%queue 2```\n"
-                "```%queue clear```"
-            ),
-        },
-        "shuffle": {
-            "usage": "%shuffle",
-            "short": "Shuffles the current queue in random order.",
-            "long": (
-                "Randomly reorders all songs currently waiting in the queue and updates background prefetching for the "
-                "new 5 leftmost URLs.\n\n"
-                "**Examples:**\n"
-                "```%shuffle```"
-            ),
-        },
-        "leave": {
-            "usage": "%leave",
-            "short": "Stops playback and leaves the voice channel.",
-            "long": (
-                "Stops any currently playing audio and disconnects the bot from the voice channel.\n\n"
-                "**Examples:**\n"
-                "```%leave```"
-            ),
-        },
-        "playing": {
-            "usage": "%playing",
-            "short": "Shows the current song title, filename, playback time, and duration.",
-            "long": (
-                "Displays detailed information about the currently playing (or paused) track, including song title, "
-                "relative filename, current playback position, and total duration.\n\n"
-                "**Examples:**\n"
-                "```%playing```"
-            ),
-        },
-        "pause": {
-            "usage": "%pause",
-            "short": "Pauses playback and shows the command to resume.",
-            "long": (
-                "Pauses the currently playing track and sends a confirmation message with the copyable `%resume` command.\n\n"
-                "**Examples:**\n"
-                "```%pause```"
-            ),
-        },
-        "resume": {
-            "usage": "%resume",
-            "short": "Resumes paused music playback.",
-            "long": (
-                "Resumes playback of a paused track from the exact position where it was paused.\n\n"
-                "**Examples:**\n"
-                "```%resume```"
-            ),
-        },
-        "vol": {
-            "usage": "%vol <percentage> (or %volume <percentage>)",
-            "short": "Sets and saves the playback volume percentage for this server.",
-            "long": (
-                "Adjusts the playback volume to `<percentage>%` immediately and saves it on disk for this guild so "
-                "the setting persists across bot restarts. Calling `%vol` without arguments displays the current volume.\n\n"
-                "**Examples:**\n"
-                "```%vol 50```\n"
-                "```%volume 80%```\n"
-                "```%vol```"
-            ),
-        },
-        "volume": {
-            "usage": "%volume <percentage> (alias for %vol)",
-            "short": "Alias for %vol — sets and saves the playback volume percentage.",
-            "long": (
-                "Alias for `%vol`. Adjusts the playback volume to `<percentage>%` immediately and saves it on disk for this guild.\n\n"
-                "**Examples:**\n"
-                "```%volume 75```\n"
-                "```%vol 100```"
-            ),
-        },
-        "save": {
-            "usage": "%save <name>",
-            "short": "Saves the currently playing song and queue to a .playlist file.",
-            "long": (
-                "Saves the currently playing song followed by all queued items into `<name>.playlist` (JSON format) "
-                "inside the music folder so it can be played later with `%play <name>`.\n\n"
-                "**Examples:**\n"
-                "```%save favorites```\n"
-                "```%save chill.playlist```"
-            ),
-        },
-        "download": {
-            "usage": "%download",
-            "short": "Downloads all queued URLs and replaces them in the queue with local paths.",
-            "long": (
-                "Downloads every remaining URL item in the queue to `.opus` files on disk and replaces all URLs in the "
-                "queue with their local file paths. Reports if an error stops the download.\n\n"
-                "**Examples:**\n"
-                "```%download```"
-            ),
-        },
-        "lang": {
-            "usage": "%lang <en|ru>",
-            "short": "Changes the bot language in this server to English (en) or Russian (ru).",
-            "long": (
-                "Switches all bot responses and help descriptions in this guild between English (`en`) and Russian (`ru`), "
-                "and saves the preference on disk.\n\n"
-                "**Examples:**\n"
-                "```%lang en```\n"
-                "```%lang ru```"
-            ),
-        },
-        "help": {
-            "usage": "%help [command]",
-            "short": "Lists all commands or shows detailed help and examples for a specific command.",
-            "long": (
-                "Without arguments, lists all available bot commands with a short description. When given a command name, "
-                "displays its full explanation and usage examples.\n\n"
-                "**Examples:**\n"
-                "```%help```\n"
-                "```%help play```\n"
-                "```%help %find```"
-            ),
-        },
-    },
-    "ru": {
-        "play": {
-            "usage": "%play <название | ссылка>",
-            "short": "Воспроизводит песню или плейлист из локальной папки, поиска YouTube или по ссылке.",
-            "long": (
-                "Ищет `<название>` в локальной папке с музыкой. Если найдено ровно 1 совпадение (аудиофайл или `.playlist`), "
-                "добавляет его в очередь. Если совпадений нет или их несколько — ищет песню на YouTube, скачивает в формате `.opus` "
-                "и добавляет в очередь. Если передана ссылка на песню — скачивает её; если ссылка на плейлист — добавляет все песни "
-                "в очередь и держит 5 первых ссылок в очереди предзагруженными в фоне.\n\n"
-                "**Примеры:**\n"
-                "```%play Cool guy```\n"
-                "```%play Theta.wav```\n"
-                "```%play https://www.youtube.com/watch?v=dQw4w9WgXcQ```\n"
-                "```%play https://www.youtube.com/playlist?list=PL123456789```"
-            ),
-        },
-        "playnext": {
-            "usage": "%playnext <название | ссылка>",
-            "short": "То же, что %play, но добавляет песню или плейлист в начало очереди.",
-            "long": (
-                "Работает аналогично `%play` (поддерживает локальные файлы, `.playlist`, поиск на YouTube, ссылки на треки и плейлисты), "
-                "но помещает песни в самое начало очереди.\n\n"
-                "**Примеры:**\n"
-                "```%playnext Cool guy```\n"
-                "```%playnext https://www.youtube.com/watch?v=dQw4w9WgXcQ```"
-            ),
-        },
-        "find": {
-            "usage": "%find <шаблон> [--page n]",
-            "short": "Ищет аудиофайлы и файлы .playlist в музыкальной папке по шаблону.",
-            "long": (
-                "Ищет в папке с музыкой аудиофайлы (`.opus`, `.mp3`, `.wav`, `.flac`, `.ogg`, `.m4a`, `.aac`) и плейлисты `.playlist`, "
-                "соответствующие `<шаблону>`. Все слова шаблона ищутся без учёта регистра в относительном пути файла; если указан "
-                "точный относительный путь — возвращается только этот файл. Поддерживает пагинацию через `--page n`.\n\n"
-                "**Примеры:**\n"
-                "```%find Cool guy```\n"
-                "```%find Cool guy --page 2```\n"
-                "```%find subdir/song.opus```"
-            ),
-        },
-        "skip": {
-            "usage": "%skip [количество | all]",
-            "short": "Пропускает указанное число песен или очищает очередь и останавливает музыку при 'all'.",
-            "long": (
-                "Пропускает текущую песню и переходит к следующей в очереди. Если аргумент не указан — пропускает 1 песню. "
-                "Если число больше длины очереди или указано `all` — очищает очередь и останавливает воспроизведение.\n\n"
-                "**Примеры:**\n"
-                "```%skip```\n"
-                "```%skip 3```\n"
-                "```%skip all```"
-            ),
-        },
-        "queue": {
-            "usage": "%queue [номер_страницы | clear]",
-            "short": "Показывает содержимое очереди по страницам или очищает очередь.",
-            "long": (
-                "Отображает текущую очередь воспроизведения (по 10 песен на странице) и команду для перехода на следующую страницу. "
-                "Аргумент `clear` полностью очищает очередь.\n\n"
-                "**Примеры:**\n"
-                "```%queue```\n"
-                "```%queue 2```\n"
-                "```%queue clear```"
-            ),
-        },
-        "shuffle": {
-            "usage": "%shuffle",
-            "short": "Перемешивает очередь в случайном порядке.",
-            "long": (
-                "Перемешивает все песни в очереди в случайном порядке и обновляет фоновую предзагрузку для первых 5 ссылок.\n\n"
-                "**Примеры:**\n"
-                "```%shuffle```"
-            ),
-        },
-        "leave": {
-            "usage": "%leave",
-            "short": "Останавливает воспроизведение и выходит из голосового канала.",
-            "long": (
-                "Останавливает текущую музыку и отключает бота от голосового канала.\n\n"
-                "**Примеры:**\n"
-                "```%leave```"
-            ),
-        },
-        "playing": {
-            "usage": "%playing",
-            "short": "Показывает информацию о текущей песне, файле, времени и длительности.",
-            "long": (
-                "Показывает подробную информацию о текущем треке: название, имя файла, текущее время воспроизведения и общую длительность.\n\n"
-                "**Примеры:**\n"
-                "```%playing```"
-            ),
-        },
-        "pause": {
-            "usage": "%pause",
-            "short": "Ставит музыку на паузу и выводит команду для продолжения.",
-            "long": (
-                "Приостанавливает воспроизведение текущего трека и отправляет сообщение с командой `%resume`.\n\n"
-                "**Примеры:**\n"
-                "```%pause```"
-            ),
-        },
-        "resume": {
-            "usage": "%resume",
-            "short": "Возобновляет воспроизведение музыки после паузы.",
-            "long": (
-                "Продолжает воспроизведение приостановленного трека с того же места.\n\n"
-                "**Примеры:**\n"
-                "```%resume```"
-            ),
-        },
-        "vol": {
-            "usage": "%vol <процент> (или %volume <процент>)",
-            "short": "Изменяет и сохраняет громкость музыки на сервере в процентах.",
-            "long": (
-                "Устанавливает громкость воспроизведения на `<процент>%` и сохраняет её на диске для текущего сервера, "
-                "чтобы настройка сохранялась после перезапуска бота.\n\n"
-                "**Примеры:**\n"
-                "```%vol 50```\n"
-                "```%volume 80%```\n"
-                "```%vol```"
-            ),
-        },
-        "volume": {
-            "usage": "%volume <процент> (синоним %vol)",
-            "short": "Синоним %vol — изменяет и сохраняет громкость музыки в процентах.",
-            "long": (
-                "Синоним команды `%vol`. Изменяет громкость музыки на `<процент>%` и сохраняет настройку на диске.\n\n"
-                "**Примеры:**\n"
-                "```%volume 75```\n"
-                "```%vol 100```"
-            ),
-        },
-        "save": {
-            "usage": "%save <название>",
-            "short": "Сохраняет текущую песню и очередь в файл плейлиста .playlist.",
-            "long": (
-                "Сохраняет текущую воспроизводимую песню и всю очередь в JSON-файл `<название>.playlist` в музыкальной папке.\n\n"
-                "**Примеры:**\n"
-                "```%save favorites```\n"
-                "```%save chill.playlist```"
-            ),
-        },
-        "download": {
-            "usage": "%download",
-            "short": "Скачивает все песни из очереди и заменяет ссылки на локальные пути.",
-            "long": (
-                "Скачивает все оставшиеся ссылки в очереди в формат `.opus` и заменяет ссылки в очереди на локальные пути к файлам. "
-                "В случае ошибки сообщает, сколько песен удалось скачать и на какой произошла ошибка.\n\n"
-                "**Примеры:**\n"
-                "```%download```"
-            ),
-        },
-        "lang": {
-            "usage": "%lang <en|ru>",
-            "short": "Меняет язык бота на сервере на английский (en) или русский (ru).",
-            "long": (
-                "Переключает язык сообщений и справки бота на сервере между английским (`en`) и русским (`ru`) с сохранением на диске.\n\n"
-                "**Примеры:**\n"
-                "```%lang en```\n"
-                "```%lang ru```"
-            ),
-        },
-        "help": {
-            "usage": "%help [команда]",
-            "short": "Показывает список всех команд или подробную справку по выбранной команде.",
-            "long": (
-                "Без аргументов выводит список всех команд с кратким описанием. Если указано имя команды — выводит подробное описание и примеры.\n\n"
-                "**Примеры:**\n"
-                "```%help```\n"
-                "```%help play```\n"
-                "```%help %find```"
-            ),
-        },
-    },
-}
 
-MESSAGES = {
-    "en": {
-        "join_voice": "Please join a voice channel first!",
-        "searching": "Searching for song",
-        "no_playable": "No playable songs found.",
-        "playing_single": "Playing {name}",
-        "playing_multi": "Playing {name} and added {count} song(s) to queue",
-        "added_single": "Added to {pos} {name}",
-        "added_multi": "Added {count} songs to {pos}",
-        "pos_front": "beginning of queue",
-        "pos_end": "queue",
-        "now_playing_none": "Now playing: {name}",
-        "status_paused": "Paused",
-        "status_playing": "Playing",
-        "now_playing_info": (
-            "Now playing: {title} ({status})\n"
-            "Filename: {filename}\n"
-            "Current playback time: {elapsed}\n"
-            "Duration: {duration}"
-        ),
-        "queue_empty": "Queue is empty",
-        "started_download": "Started download",
-        "download_error": (
-            "Download stopped due to an error after downloading {count} song(s). "
-            "Failed on song #{idx} (`{song}`): {err}"
-        ),
-        "download_done": "Downloaded all {count} song(s) in queue and replaced URLs with local paths.",
-        "find_usage": "Usage: `%find <song or artist name>` --page n to specify page",
-        "dir_missing": "Directory `{folder}` does not exist on host machine.",
-        "find_page_err": "Please specify a number after '--page' for example %find something --page 3",
-        "find_none": "No audio files found matching `{pattern}`.",
-        "find_header": "🔍 **Found {total} matching file(s) (Page {page}/{pages}):**\n\n",
-        "find_more": "\n\n... and {remaining} more result(s).\n\nPlease use ```%find {pattern} --page {next_page}``` to see the rest",
-        "skip_pos_err": "Please specify a positive number of songs to skip or `all`.",
-        "skip_invalid": "Invalid skip amount. Usage: `%skip [amount|all]`",
-        "skip_cleared": "Cleared queue and stopped playing.",
-        "skipped_n": "Skipped {amount} song(s) (was playing: {current})",
-        "queue_cleared": "Queue is cleared",
-        "queue_usage": "Usage: `%queue [page_number]`",
-        "queue_next": "Use ```%queue {next_page}``` to see the next page",
-        "shuffled": "Queue shuffled.",
-        "not_in_voice": "Bot is not in a voice channel.",
-        "left_voice": "Left voice channel.",
-        "nothing_playing": "Nothing is currently playing.",
-        "paused": "Music paused. Use ```%resume``` to resume it.",
-        "not_paused": "Music is not paused.",
-        "resumed": "Music resumed.",
-        "vol_current": "Current volume: {vol}%. Usage: `{cmd} <percentage>`",
-        "vol_neg": "Volume percentage cannot be negative.",
-        "vol_invalid": "Invalid percentage. Usage: `{cmd} <percentage>`",
-        "vol_set": "Volume set to {vol}%.",
-        "save_usage": "Usage: `%save <name>`",
-        "save_empty": "Nothing is playing and queue is empty.",
-        "saved_playlist": "Saved {count} song(s) to playlist `{name}`.",
-        "lang_usage": "Usage: `%lang <en|ru>`",
-        "lang_set": "Language set to English (`en`).",
-        "help_header": "**Available Commands:**\n",
-        "help_footer": "\nUse `%help <command>` for detailed info and examples.",
-        "help_unknown": "Unknown command `{cmd}`. Use `%help` to see all available commands.",
-    },
-    "ru": {
-        "join_voice": "Пожалуйста, сначала зайдите в голосовой канал!",
-        "searching": "Searching for song",
-        "no_playable": "Не найдено доступных для воспроизведения песен.",
-        "playing_single": "Playing {name}",
-        "playing_multi": "Playing {name} and added {count} song(s) to queue",
-        "added_single": "Added to {pos} {name}",
-        "added_multi": "Added {count} songs to {pos}",
-        "pos_front": "beginning of queue",
-        "pos_end": "queue",
-        "now_playing_none": "Сейчас играет: {name}",
-        "status_paused": "Пауза",
-        "status_playing": "Играет",
-        "now_playing_info": (
-            "Now playing: {title} ({status})\n"
-            "Filename: {filename}\n"
-            "Current playback time: {elapsed}\n"
-            "Duration: {duration}"
-        ),
-        "queue_empty": "Очередь пуста",
-        "started_download": "Started download",
-        "download_error": (
-            "Загрузка остановлена из-за ошибки после скачивания {count} песен(и). "
-            "Ошибка на песне #{idx} (`{song}`): {err}"
-        ),
-        "download_done": "Скачано {count} песен(и) из очереди, все ссылки заменены на локальные пути.",
-        "find_usage": "Использование: `%find <название песни или исполнителя>` --page n для выбора страницы",
-        "dir_missing": "Директория `{folder}` не существует на хост-машине.",
-        "find_page_err": "Пожалуйста, укажите число после '--page', например %find something --page 3",
-        "find_none": "Аудиофайлы по запросу `{pattern}` не найдены.",
-        "find_header": "🔍 **Найдено совпадающих файлов: {total} (Страница {page}/{pages}):**\n\n",
-        "find_more": "\n\n... и ещё {remaining} результат(ов).\n\nИспользуйте ```%find {pattern} --page {next_page}``` для просмотра остальных",
-        "skip_pos_err": "Пожалуйста, укажите положительное число песен для пропуска или `all`.",
-        "skip_invalid": "Некорректное количество. Использование: `%skip [количество|all]`",
-        "skip_cleared": "Очередь очищена и воспроизведение остановлено.",
-        "skipped_n": "Пропущено песен: {amount} (играло: {current})",
-        "queue_cleared": "Очередь очищена",
-        "queue_usage": "Использование: `%queue [номер_страницы]`",
-        "queue_next": "Используйте ```%queue {next_page}``` для следующей страницы",
-        "shuffled": "Очередь перемешана.",
-        "not_in_voice": "Бот не находится в голосовом канале.",
-        "left_voice": "Бот покинул голосовой канал.",
-        "nothing_playing": "Сейчас ничего не играет.",
-        "paused": "Музыка на паузе. Используйте ```%resume``` для продолжения.",
-        "not_paused": "Музыка не стоит на паузе.",
-        "resumed": "Воспроизведение возобновлено.",
-        "vol_current": "Текущая громкость: {vol}%. Использование: `{cmd} <процент>`",
-        "vol_neg": "Громкость не может быть отрицательной.",
-        "vol_invalid": "Некорректный процент. Использование: `{cmd} <процент>`",
-        "vol_set": "Громкость установлена на {vol}%.",
-        "save_usage": "Использование: `%save <название>`",
-        "save_empty": "Сейчас ничего не играет и очередь пуста.",
-        "saved_playlist": "Сохранено {count} песен(и) в плейлист `{name}`.",
-        "lang_usage": "Использование: `%lang <en|ru>`",
-        "lang_set": "Язык бота изменён на русский (`ru`).",
-        "help_header": "**Список доступных команд:**\n",
-        "help_footer": "\nИспользуйте `%help <команда>` для подробного описания и примеров.",
-        "help_unknown": "Неизвестная команда `{cmd}`. Используйте `%help` для просмотра всех команд.",
-    },
-}
+def load_localization_data(
+    lang_file_path: str | None = None,
+) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Load COMMAND_HELP and MESSAGES dictionaries from lang.json in project folder."""
+    candidate_paths: list[str] = []
+    if lang_file_path:
+        candidate_paths.append(lang_file_path)
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    candidate_paths.append(os.path.join(base_dir, LANG_DATA_FILENAME))
+    candidate_paths.append(os.path.abspath(LANG_DATA_FILENAME))
+
+    for path in candidate_paths:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                cmd_help = data.get("COMMAND_HELP", {})
+                messages = data.get("MESSAGES", {})
+                if cmd_help or messages:
+                    return cmd_help, messages
+    return {"en": {}, "ru": {}}, {"en": {}, "ru": {}}
+
+
+COMMAND_HELP, MESSAGES = load_localization_data()
 
 
 def is_url(text: str) -> bool:
@@ -536,15 +100,72 @@ def normalize_url(text: str) -> str:
     return text
 
 
-def format_seconds(seconds: float | None) -> str:
+def format_seconds(seconds: float | None, unknown_label: str = "Unknown") -> str:
     if seconds is None or seconds < 0:
-        return "Unknown"
+        return unknown_label
     total_seconds = int(seconds)
     hours, remainder = divmod(total_seconds, 3600)
     minutes, secs = divmod(remainder, 60)
     if hours > 0:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def build_progress_bar(
+    elapsed: float,
+    duration: float | None,
+    length: int = PROGRESS_BAR_LENGTH,
+    filled_char: str = "█",
+    empty_char: str = "░",
+) -> str:
+    """Build a partially filled playback progress bar."""
+    if length < 2:
+        length = 2
+    if duration is None or duration <= 0:
+        filled = length // 2 if elapsed > 0 else 0
+        bar = filled_char * filled + empty_char * (length - filled)
+        return f"[{bar}]"
+
+    ratio = max(0.0, min(1.0, elapsed / duration))
+    filled = int(round(ratio * length))
+    if 0 < elapsed < duration:
+        filled = max(1, min(length - 1, filled))
+    pct = int(round(ratio * 100))
+    bar = filled_char * filled + empty_char * (length - filled)
+    return f"[{bar}] {pct}%"
+
+
+def parse_filename_metadata(
+    path_or_name: str,
+) -> tuple[str | None, str | None, str | None]:
+    """Extract (author, clean_title, video_id) from a filename like 'Uploader - Title[id].opus'."""
+    if not path_or_name:
+        return None, None, None
+    base = os.path.basename(path_or_name.replace("\\", "/"))
+    stem, ext = os.path.splitext(base)
+    if ext.lower() not in SEARCHABLE_EXTENSIONS and not stem:
+        stem = base
+
+    video_id: str | None = None
+    match = re.match(r"^(.*?)\[([A-Za-z0-9_-]{6,20})\]$", stem)
+    if match:
+        stem = match.group(1).strip()
+        video_id = match.group(2).strip()
+
+    author: str | None = None
+    clean_title = stem.strip()
+    if " - " in clean_title:
+        parts = clean_title.split(" - ", 1)
+        candidate_author = parts[0].strip()
+        candidate_title = parts[1].strip()
+        if candidate_author and candidate_title:
+            author = candidate_author
+            clean_title = candidate_title
+
+    if author in ("NA", "None", "null"):
+        author = None
+
+    return author, clean_title or base, video_id
 
 
 def probe_audio_duration(file_path: str) -> float | None:
@@ -646,11 +267,62 @@ class QueueItem:
     url: str | None = None
     video_id: str | None = None
     duration: float | None = None
+    author: str | None = None
+    added_by: str | None = None
+    thumbnail: str | None = None
+    batch_id: int | None = None
     download_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
     def __post_init__(self):
-        if self.local_path and os.path.exists(self.local_path):
-            self.download_event.set()
+        if self.local_path:
+            parsed_author, _, parsed_vid = parse_filename_metadata(self.local_path)
+            if not self.author and parsed_author:
+                self.author = parsed_author
+            if not self.video_id and parsed_vid:
+                self.video_id = parsed_vid
+            if os.path.exists(self.local_path):
+                self.download_event.set()
+        if not self.thumbnail and self.video_id:
+            self.thumbnail = f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
+
+    def clean_title(self) -> str:
+        if self.title and not is_url(self.title):
+            ext = os.path.splitext(self.title)[1].lower()
+            if (
+                ext not in SEARCHABLE_EXTENSIONS
+                and "/" not in self.title
+                and "\\" not in self.title
+            ):
+                _, parsed_title, _ = parse_filename_metadata(self.title)
+                return parsed_title or self.title
+            _, parsed_title, _ = parse_filename_metadata(self.title)
+            if parsed_title:
+                return parsed_title
+        if self.local_path:
+            _, parsed_title, _ = parse_filename_metadata(self.local_path)
+            if parsed_title:
+                return parsed_title
+        return self.title or self.url or "Unknown"
+
+    def get_author(self, default: str = "Unknown Artist") -> str:
+        if self.author and self.author not in ("NA", "None"):
+            return self.author
+        for candidate in (self.local_path, self.title):
+            if candidate:
+                parsed_author, _, _ = parse_filename_metadata(candidate)
+                if parsed_author:
+                    return parsed_author
+        return default
+
+    def get_thumbnail(self) -> str | None:
+        if self.thumbnail:
+            return self.thumbnail
+        vid = self.video_id
+        if not vid and self.local_path:
+            _, _, vid = parse_filename_metadata(self.local_path)
+        if vid:
+            return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+        return None
 
     def display_name(self, music_folder: str | None = None) -> str:
         if music_folder is None:
@@ -680,12 +352,298 @@ class QueueItem:
             return self.local_path
         return self.url or self.title
 
+    def clone_for_queue(self) -> "QueueItem":
+        return QueueItem(
+            title=self.title,
+            local_path=self.local_path,
+            url=self.url,
+            video_id=self.video_id,
+            duration=self.duration,
+            author=self.author,
+            added_by=self.added_by,
+            thumbnail=self.thumbnail,
+            batch_id=self.batch_id,
+        )
+
+
+# Safe UI base classes for both real discord.py and mocked test environments
+_HAS_DISCORD_UI = (
+    hasattr(discord, "ui")
+    and hasattr(discord.ui, "View")
+    and isinstance(getattr(discord.ui, "View", None), type)
+    and hasattr(discord.ui, "Button")
+    and isinstance(getattr(discord.ui, "Button", None), type)
+)
+
+
+class _FallbackButton:
+    def __init__(
+        self,
+        *,
+        label: str = "",
+        style=None,
+        custom_id: str | None = None,
+        row: int | None = None,
+        disabled: bool = False,
+    ):
+        self.label = label
+        self.style = style
+        self.custom_id = custom_id
+        self.row = row
+        self.disabled = disabled
+        self.callback = None
+
+
+class _FallbackView:
+    def __init__(self, *, timeout: float | None = None):
+        self.timeout = timeout
+        self.children: list = []
+
+    def add_item(self, item):
+        self.children.append(item)
+        return self
+
+
+_ViewBase = discord.ui.View if _HAS_DISCORD_UI else _FallbackView
+_ButtonClass = discord.ui.Button if _HAS_DISCORD_UI else _FallbackButton
+
+
+def _button_style(name: str, default=None):
+    styles = getattr(discord, "ButtonStyle", None)
+    if styles is not None and hasattr(styles, name):
+        return getattr(styles, name)
+    return default
+
+
+class PlayerView(_ViewBase):
+    """Interactive music player view arranged in a clean 5x3 button grid (no modal)."""
+
+    def __init__(self, client: "MyClient", guild_id: int):
+        try:
+            super().__init__(timeout=None)
+        except Exception:
+            _FallbackView.__init__(self, timeout=None)
+        self.client = client
+        self.guild_id = guild_id
+        self.buttons_by_action: dict[str, object] = {}
+        self._build_buttons()
+
+    def _add_action_button(
+        self,
+        action: str,
+        label_key: str,
+        style_name: str,
+        row: int,
+        callback,
+    ):
+        label = self.client.t(self.guild_id, label_key)
+        btn = _ButtonClass(
+            label=label,
+            style=_button_style(style_name),
+            custom_id=f"player_{action}_{self.guild_id}",
+            row=row,
+        )
+        btn.callback = callback
+        self.buttons_by_action[action] = btn
+        self.add_item(btn)
+
+    def _build_buttons(self):
+        vc = self.client.voice_client.get(self.guild_id)
+        is_paused = bool(vc and getattr(vc, "is_paused", lambda: False)())
+        pause_key = "btn_resume" if is_paused else "btn_pause"
+        pause_style = "success" if is_paused else "primary"
+
+        # Row 0 (5 buttons): Previous, Seek -10s, Pause/Resume, Seek +10s, Skip
+        self._add_action_button("prev", "btn_prev", "secondary", 0, self.on_prev)
+        self._add_action_button(
+            "seek_back", "btn_seek_back", "secondary", 0, self.on_seek_back
+        )
+        self._add_action_button(
+            "pause_resume", pause_key, pause_style, 0, self.on_pause_resume
+        )
+        self._add_action_button(
+            "seek_fwd", "btn_seek_fwd", "secondary", 0, self.on_seek_fwd
+        )
+        self._add_action_button("skip", "btn_skip", "primary", 0, self.on_skip)
+
+        # Row 1 (5 buttons): Shuffle, Queue, Cancel latest %play, Stop, Leave
+        self._add_action_button(
+            "shuffle", "btn_shuffle", "secondary", 1, self.on_shuffle
+        )
+        self._add_action_button("queue", "btn_queue", "secondary", 1, self.on_queue)
+        self._add_action_button("cancel", "btn_cancel", "secondary", 1, self.on_cancel)
+        self._add_action_button("stop", "btn_stop", "danger", 1, self.on_stop)
+        self._add_action_button("leave", "btn_leave", "danger", 1, self.on_leave)
+
+        # Row 2 (5 buttons): Volume -25%, Volume -10%, Volume 100%, Volume +10%, Volume +25%
+        self._add_action_button(
+            "vol_down_25", "btn_vol_down_25", "secondary", 2, self.on_vol_down_25
+        )
+        self._add_action_button(
+            "vol_down", "btn_vol_down", "secondary", 2, self.on_vol_down
+        )
+        self._add_action_button(
+            "vol_reset", "btn_vol_reset", "secondary", 2, self.on_vol_reset
+        )
+        self._add_action_button("vol_up", "btn_vol_up", "secondary", 2, self.on_vol_up)
+        self._add_action_button(
+            "vol_up_25", "btn_vol_up_25", "secondary", 2, self.on_vol_up_25
+        )
+
+    def sync_labels(self):
+        vc = self.client.voice_client.get(self.guild_id)
+        is_paused = bool(vc and getattr(vc, "is_paused", lambda: False)())
+        pause_btn = self.buttons_by_action.get("pause_resume")
+        if pause_btn is not None:
+            pause_btn.label = self.client.t(
+                self.guild_id, "btn_resume" if is_paused else "btn_pause"
+            )
+            pause_btn.style = _button_style("success" if is_paused else "primary")
+
+    async def refresh_player_message(self, interaction=None):
+        self.sync_labels()
+        msg = getattr(interaction, "message", None) or self.client.player_messages.get(
+            self.guild_id
+        )
+        if msg is not None and hasattr(msg, "edit"):
+            current_item = self.client.now_playing_item.get(self.guild_id)
+            if current_item is not None:
+                fallback_text, embed = self.client.build_player_display(
+                    self.guild_id, current_item
+                )
+                await self.client._safe_edit(
+                    msg, None, embed=embed, view=self, fallback_text=fallback_text
+                )
+
+    async def on_pause_resume(self, interaction):
+        vc = self.client.voice_client.get(self.guild_id)
+        if vc is not None and getattr(vc, "is_playing", lambda: False)():
+            vc.pause()
+            state = self.client.playback_state.get(self.guild_id)
+            if state is not None and state.get("pause_start") is None:
+                state["pause_start"] = time.monotonic()
+            self.sync_labels()
+            await self.client._respond_interaction(
+                interaction, self.client.t(self.guild_id, "paused")
+            )
+            await self.refresh_player_message(interaction)
+        elif vc is not None and getattr(vc, "is_paused", lambda: False)():
+            vc.resume()
+            state = self.client.playback_state.get(self.guild_id)
+            if state is not None and state.get("pause_start") is not None:
+                state["paused_total"] = (state.get("paused_total") or 0.0) + (
+                    time.monotonic() - state["pause_start"]
+                )
+                state["pause_start"] = None
+            self.sync_labels()
+            await self.client._respond_interaction(
+                interaction, self.client.t(self.guild_id, "resumed")
+            )
+            await self.refresh_player_message(interaction)
+        else:
+            await self.client._respond_interaction(
+                interaction, self.client.t(self.guild_id, "nothing_playing")
+            )
+
+    async def on_skip(self, interaction):
+        reply = await self.client.execute_skip(
+            self.guild_id, amount=1, recreate_player=True
+        )
+        await self.client._respond_interaction(interaction, reply)
+
+    async def on_prev(self, interaction):
+        reply = await self.client.execute_prev(
+            self.guild_id, amount=1, recreate_player=True
+        )
+        await self.client._respond_interaction(interaction, reply)
+
+    async def on_seek_back(self, interaction):
+        reply = await self.client.execute_seek(self.guild_id, -10.0)
+        await self.client._respond_interaction(interaction, reply)
+
+    async def on_seek_fwd(self, interaction):
+        reply = await self.client.execute_seek(self.guild_id, 10.0)
+        await self.client._respond_interaction(interaction, reply)
+
+    async def on_shuffle(self, interaction):
+        queue = self.client.queue[self.guild_id]
+        if not queue:
+            await self.client._respond_interaction(
+                interaction, self.client.t(self.guild_id, "queue_empty")
+            )
+            return
+        items = list(queue)
+        random.shuffle(items)
+        queue.clear()
+        queue.extend(items)
+        self.client.trigger_background_downloads(self.guild_id)
+        await self.client._respond_interaction(
+            interaction, self.client.t(self.guild_id, "shuffled")
+        )
+
+    async def on_queue(self, interaction):
+        queue_text = self.client.format_queue_page(self.guild_id, page=1)
+        await self.client._respond_interaction(interaction, queue_text)
+
+    async def on_cancel(self, interaction):
+        reply = await self.client.execute_cancel(self.guild_id, recreate_player=True)
+        await self.client._respond_interaction(interaction, reply)
+
+    async def on_stop(self, interaction):
+        reply = await self.client.execute_skip(
+            self.guild_id, amount=None, recreate_player=False
+        )
+        await self.client._respond_interaction(interaction, reply)
+
+    async def _adjust_volume(
+        self,
+        interaction,
+        delta: float | None = None,
+        exact: float | None = None,
+    ):
+        if exact is not None:
+            new_pct = max(MIN_VOLUME_PERCENT, min(MAX_VOLUME_PERCENT, exact))
+        else:
+            current_pct = round(self.client.volume[self.guild_id] * 100)
+            new_pct = max(
+                MIN_VOLUME_PERCENT,
+                min(MAX_VOLUME_PERCENT, current_pct + (delta or 0.0)),
+            )
+        applied = self.client.set_guild_volume(self.guild_id, new_pct)
+        display_pct = int(applied) if applied.is_integer() else applied
+        await self.client._respond_interaction(
+            interaction, self.client.t(self.guild_id, "vol_set", vol=display_pct)
+        )
+        await self.refresh_player_message(interaction)
+
+    async def on_vol_down_25(self, interaction):
+        await self._adjust_volume(interaction, delta=-25.0)
+
+    async def on_vol_down(self, interaction):
+        await self._adjust_volume(interaction, delta=-10.0)
+
+    async def on_vol_reset(self, interaction):
+        await self._adjust_volume(interaction, exact=100.0)
+
+    async def on_vol_up(self, interaction):
+        await self._adjust_volume(interaction, delta=10.0)
+
+    async def on_vol_up_25(self, interaction):
+        await self._adjust_volume(interaction, delta=25.0)
+
+    async def on_leave(self, interaction):
+        reply = await self.client.execute_leave(self.guild_id)
+        await self.client._respond_interaction(interaction, reply)
+
 
 class MyClient(discord.Client):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.voice_client: dict[int, discord.VoiceClient] = {}
         self.queue: dict[int, deque[QueueItem]] = defaultdict(deque)
+        self.history: dict[int, deque[QueueItem]] = defaultdict(deque)
+        self.play_batches: dict[int, list[int]] = defaultdict(list)
+        self._next_batch_id: int = 1
         self.now_playing: dict[int, str] = {}
         self.now_playing_item: dict[int, QueueItem | None] = {}
         self.playback_state: dict[int, dict[str, float | None]] = {}
@@ -693,11 +651,15 @@ class MyClient(discord.Client):
         self.language: dict[int, str] = defaultdict(lambda: "en")
         self.url_cache: dict[str, str] = {}
         self.video_id_cache: dict[str, str] = {}
+        self.metadata_cache: dict[str, dict[str, object]] = {}
         self.inflight_downloads: dict[
             str, asyncio.Future[tuple[str, float | None, str | None]]
         ] = {}
         self.prefetch_tasks: dict[int, asyncio.Task] = {}
         self.play_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self.player_messages: dict[int, object] = {}
+        self.last_text_channel: dict[int, object] = {}
+        self._suppress_after: set[int] = set()
 
         self.load_url_map()
         self.load_volumes()
@@ -718,8 +680,8 @@ class MyClient(discord.Client):
 
     def t(self, guild_id: int, key: str, **kwargs) -> str:
         lang = self.language.get(guild_id, "en")
-        lang_dict = MESSAGES.get(lang, MESSAGES["en"])
-        template = lang_dict.get(key, MESSAGES["en"].get(key, key))
+        lang_dict = MESSAGES.get(lang, MESSAGES.get("en", {}))
+        template = lang_dict.get(key, MESSAGES.get("en", {}).get(key, key))
         return template.format(**kwargs) if kwargs else template
 
     def load_url_map(self):
@@ -770,7 +732,7 @@ class MyClient(discord.Client):
         self.save_url_map()
 
     def load_volumes(self):
-        """Load persistent per-guild volume settings from disk."""
+        """Load persistent per-guild volume settings from disk (capped between 0 and 200%)."""
         path = self.volume_map_path
         if not os.path.isfile(path):
             return
@@ -780,7 +742,11 @@ class MyClient(discord.Client):
             if isinstance(data, dict):
                 for guild_id_str, vol in data.items():
                     try:
-                        self.volume[int(guild_id_str)] = float(vol)
+                        clamped_vol = max(
+                            MIN_VOLUME_PERCENT / 100.0,
+                            min(MAX_VOLUME_PERCENT / 100.0, float(vol)),
+                        )
+                        self.volume[int(guild_id_str)] = clamped_vol
                     except (ValueError, TypeError):
                         pass
         except Exception:
@@ -797,6 +763,22 @@ class MyClient(discord.Client):
                 json.dump(serializable, f, indent=2)
         except Exception:
             pass
+
+    def set_guild_volume(self, guild_id: int, percentage: float) -> float:
+        """Set and save guild volume percentage, capped between 0% and 200%."""
+        clamped_pct = max(
+            MIN_VOLUME_PERCENT, min(MAX_VOLUME_PERCENT, float(percentage))
+        )
+        self.volume[guild_id] = clamped_pct / 100.0
+        self.save_volumes()
+        voice_client = self.voice_client.get(guild_id)
+        if (
+            voice_client is not None
+            and getattr(voice_client, "source", None) is not None
+        ):
+            if hasattr(voice_client.source, "volume"):
+                voice_client.source.volume = self.volume[guild_id]
+        return clamped_pct
 
     def load_languages(self):
         """Load persistent per-guild language settings from disk."""
@@ -942,7 +924,6 @@ class MyClient(discord.Client):
             if cached:
                 if os.path.isfile(cached):
                     return cached
-                # Mapped local file does not exist on disk anymore; will re-download and update mapping
         if video_id:
             existing = self.find_existing_opus_by_id(video_id)
             if existing and os.path.isfile(existing):
@@ -950,6 +931,69 @@ class MyClient(discord.Client):
                     self.update_url_mapping(url, existing)
                 return existing
         return None
+
+    def _extract_info_metadata(self, info: dict, opus_path: str | None = None):
+        video_id = info.get("id")
+        duration = info.get("duration")
+        title = info.get("title")
+        author = (
+            info.get("uploader")
+            or info.get("artist")
+            or info.get("channel")
+            or info.get("creator")
+        )
+        thumbnail = info.get("thumbnail")
+        if not thumbnail and info.get("thumbnails"):
+            thumbs = [
+                t.get("url")
+                for t in info["thumbnails"]
+                if isinstance(t, dict) and t.get("url")
+            ]
+            if thumbs:
+                thumbnail = thumbs[-1]
+        if not thumbnail and video_id:
+            thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+        meta = {
+            "title": title,
+            "author": author,
+            "thumbnail": thumbnail,
+            "duration": duration,
+            "video_id": video_id,
+        }
+        if opus_path:
+            self.metadata_cache[opus_path] = meta
+        if video_id:
+            self.metadata_cache[f"id:{video_id}"] = meta
+        return meta
+
+    def _apply_cached_metadata(self, item: QueueItem):
+        meta = None
+        if item.local_path and item.local_path in self.metadata_cache:
+            meta = self.metadata_cache[item.local_path]
+        elif item.video_id and f"id:{item.video_id}" in self.metadata_cache:
+            meta = self.metadata_cache[f"id:{item.video_id}"]
+
+        if meta:
+            if not item.author and meta.get("author"):
+                item.author = str(meta["author"])
+            if not item.thumbnail and meta.get("thumbnail"):
+                item.thumbnail = str(meta["thumbnail"])
+            if item.duration is None and meta.get("duration") is not None:
+                item.duration = float(meta["duration"])
+            if not item.video_id and meta.get("video_id"):
+                item.video_id = str(meta["video_id"])
+
+        if item.local_path:
+            parsed_author, _, parsed_vid = parse_filename_metadata(item.local_path)
+            if not item.author and parsed_author:
+                item.author = parsed_author
+            if not item.video_id and parsed_vid:
+                item.video_id = parsed_vid
+            if item.duration is None and os.path.isfile(item.local_path):
+                item.duration = probe_audio_duration(item.local_path)
+        if not item.thumbnail and item.video_id:
+            item.thumbnail = f"https://i.ytimg.com/vi/{item.video_id}/hqdefault.jpg"
 
     def _download_with_ytdlp_sync(
         self, query_or_url: str
@@ -960,11 +1004,12 @@ class MyClient(discord.Client):
             norm_url = normalize_url(query_or_url)
             cached = self.get_cached_download(norm_url)
             if cached:
+                _, parsed_title, parsed_vid = parse_filename_metadata(cached)
                 return (
                     cached,
                     probe_audio_duration(cached),
-                    os.path.basename(cached),
-                    None,
+                    parsed_title or os.path.basename(cached),
+                    parsed_vid,
                 )
 
         # First extract info without downloading to check if video_id is already on disk
@@ -986,6 +1031,7 @@ class MyClient(discord.Client):
                 video_id,
             )
             if existing:
+                self._extract_info_metadata(info, existing)
                 if is_url(query_or_url):
                     self.update_url_mapping(query_or_url, existing)
                 if info.get("webpage_url"):
@@ -996,6 +1042,7 @@ class MyClient(discord.Client):
             base, _ = os.path.splitext(prepared)
             opus_path = base + ".opus"
             if os.path.isfile(opus_path):
+                self._extract_info_metadata(info, opus_path)
                 if video_id:
                     self.video_id_cache[video_id] = opus_path
                 if is_url(query_or_url):
@@ -1016,6 +1063,7 @@ class MyClient(discord.Client):
             video_id = info.get("id")
             duration = info.get("duration")
             title = info.get("title")
+            self._extract_info_metadata(info, opus_path)
             if video_id:
                 self.video_id_cache[video_id] = opus_path
             if is_url(query_or_url):
@@ -1029,6 +1077,7 @@ class MyClient(discord.Client):
         if item.local_path and os.path.isfile(item.local_path):
             if item.url:
                 self.update_url_mapping(item.url, item.local_path)
+            self._apply_cached_metadata(item)
             item.download_event.set()
             return item.local_path
 
@@ -1036,8 +1085,7 @@ class MyClient(discord.Client):
         cached = self.get_cached_download(item.url, item.video_id)
         if cached:
             item.local_path = cached
-            if item.duration is None:
-                item.duration = probe_audio_duration(cached)
+            self._apply_cached_metadata(item)
             item.download_event.set()
             return cached
 
@@ -1055,8 +1103,11 @@ class MyClient(discord.Client):
                 self.update_url_mapping(item.url, opus_path)
             if duration is not None:
                 item.duration = duration
-            if title and (not item.title or item.title == item.url):
+            if title and (
+                not item.title or item.title == item.url or item.title == target
+            ):
                 item.title = title
+            self._apply_cached_metadata(item)
             item.download_event.set()
             return opus_path
 
@@ -1075,8 +1126,11 @@ class MyClient(discord.Client):
                 self.update_url_mapping(item.url, opus_path)
             if duration is not None:
                 item.duration = duration
-            if title and (not item.title or item.title == item.url):
+            if title and (
+                not item.title or item.title == item.url or item.title == target
+            ):
                 item.title = title
+            self._apply_cached_metadata(item)
             item.download_event.set()
             fut.set_result((opus_path, duration, title))
             return opus_path
@@ -1121,6 +1175,7 @@ class MyClient(discord.Client):
                     cached = self.get_cached_download(item.url, item.video_id)
                     if cached:
                         item.local_path = cached
+                        self._apply_cached_metadata(item)
                         item.download_event.set()
                     elif not item.local_path or not os.path.isfile(item.local_path):
                         next_to_download = item
@@ -1149,6 +1204,9 @@ class MyClient(discord.Client):
             if "entries" in info or info.get("_type") in ("playlist", "multi_video"):
                 raw_entries = [e for e in (info.get("entries") or []) if e]
                 results = []
+                playlist_uploader = (
+                    info.get("uploader") or info.get("channel") or info.get("artist")
+                )
                 for entry in raw_entries:
                     vid_id = entry.get("id")
                     entry_url = entry.get("url") or entry.get("webpage_url")
@@ -1156,28 +1214,52 @@ class MyClient(discord.Client):
                         entry_url = f"https://www.youtube.com/watch?v={vid_id}"
                     elif not entry_url and vid_id:
                         entry_url = f"https://www.youtube.com/watch?v={vid_id}"
+                    author = (
+                        entry.get("uploader")
+                        or entry.get("artist")
+                        or entry.get("channel")
+                        or playlist_uploader
+                    )
+                    thumbnail = entry.get("thumbnail")
+                    if not thumbnail and entry.get("thumbnails"):
+                        thumbs = [
+                            t.get("url")
+                            for t in entry["thumbnails"]
+                            if isinstance(t, dict) and t.get("url")
+                        ]
+                        if thumbs:
+                            thumbnail = thumbs[-1]
+                    if not thumbnail and vid_id:
+                        thumbnail = f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg"
                     results.append(
                         {
                             "url": normalize_url(entry_url) if entry_url else norm_url,
                             "id": vid_id,
                             "title": entry.get("title") or entry_url or norm_url,
                             "duration": entry.get("duration"),
+                            "author": author,
+                            "thumbnail": thumbnail,
                         }
                     )
                 return results
             else:
                 vid_id = info.get("id")
                 webpage_url = info.get("webpage_url") or norm_url
+                meta = self._extract_info_metadata(info)
                 return [
                     {
                         "url": normalize_url(webpage_url),
                         "id": vid_id,
                         "title": info.get("title") or norm_url,
                         "duration": info.get("duration"),
+                        "author": meta.get("author"),
+                        "thumbnail": meta.get("thumbnail"),
                     }
                 ]
 
-    def load_playlist_file(self, playlist_path: str) -> list[QueueItem]:
+    def load_playlist_file(
+        self, playlist_path: str, added_by: str | None = None
+    ) -> list[QueueItem]:
         with open(playlist_path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
@@ -1196,6 +1278,9 @@ class MyClient(discord.Client):
                 title = entry.get("title") or entry_path or entry_url or "Unknown"
                 video_id = entry.get("video_id")
                 duration = entry.get("duration")
+                author = entry.get("author")
+                item_added_by = entry.get("added_by") or added_by
+                thumbnail = entry.get("thumbnail")
                 if entry_path:
                     full_path = (
                         entry_path
@@ -1209,6 +1294,9 @@ class MyClient(discord.Client):
                             url=entry_url,
                             video_id=video_id,
                             duration=duration,
+                            author=author,
+                            added_by=item_added_by,
+                            thumbnail=thumbnail,
                         )
                     )
                 elif entry_url:
@@ -1220,6 +1308,9 @@ class MyClient(discord.Client):
                             url=normalize_url(entry_url),
                             video_id=video_id,
                             duration=duration,
+                            author=author,
+                            added_by=item_added_by,
+                            thumbnail=thumbnail,
                         )
                     )
             elif isinstance(entry, str):
@@ -1229,7 +1320,14 @@ class MyClient(discord.Client):
                 if is_url(entry_str):
                     norm = normalize_url(entry_str)
                     cached = self.get_cached_download(norm)
-                    items.append(QueueItem(title=norm, local_path=cached, url=norm))
+                    items.append(
+                        QueueItem(
+                            title=norm,
+                            local_path=cached,
+                            url=norm,
+                            added_by=added_by,
+                        )
+                    )
                 else:
                     full_path = (
                         entry_str
@@ -1239,7 +1337,13 @@ class MyClient(discord.Client):
                     rel_title = os.path.relpath(full_path, MUSIC_FOLDER).replace(
                         "\\", "/"
                     )
-                    items.append(QueueItem(title=rel_title, local_path=full_path))
+                    items.append(
+                        QueueItem(
+                            title=rel_title,
+                            local_path=full_path,
+                            added_by=added_by,
+                        )
+                    )
         return items
 
     def enqueue_items(
@@ -1259,30 +1363,365 @@ class MyClient(discord.Client):
         is_paused = getattr(voice_client, "is_paused", lambda: False)()
         return bool(is_playing or is_paused)
 
-    async def _send_or_edit(self, text_channel, status_msg, content: str):
-        if status_msg is not None and hasattr(status_msg, "edit"):
-            await status_msg.edit(content=content)
+    def _create_embed(
+        self,
+        title: str,
+        description: str = "",
+        color: int = 0x5865F2,
+        thumbnail: str | None = None,
+        fields: list[tuple[str, str, bool]] | None = None,
+    ):
+        embed_cls = getattr(discord, "Embed", None)
+        if embed_cls is None:
+            return None
+        try:
+            embed = embed_cls(title=title, description=description, color=color)
+            if thumbnail and hasattr(embed, "set_thumbnail"):
+                embed.set_thumbnail(url=thumbnail)
+            if fields and hasattr(embed, "add_field"):
+                for fname, fval, inline in fields:
+                    embed.add_field(name=fname, value=fval, inline=inline)
+            return embed
+        except Exception:
+            return None
+
+    def build_searching_embed(self, guild_id: int, query: str):
+        desc = self.t(guild_id, "searching", query=query)
+        return self._create_embed(
+            title="🔎",
+            description=desc,
+            color=0xFEE75C,
+        )
+
+    def build_error_embed(self, guild_id: int, query: str, err: object):
+        desc = self.t(guild_id, "play_error", query=query, err=err)
+        return self._create_embed(
+            title="❌",
+            description=desc,
+            color=0xED4245,
+        )
+
+    def build_player_display(
+        self,
+        guild_id: int,
+        item: QueueItem,
+        extra_added_count: int = 0,
+    ) -> tuple[str, object]:
+        """Build interactive player Embed (without playback time bar or raw thumbnail URL)."""
+        self._apply_cached_metadata(item)
+        song_name = item.clean_title()
+        author = item.get_author(self.t(guild_id, "unknown_author"))
+        added_by = item.added_by or self.t(guild_id, "unknown_user")
+        duration_str = format_seconds(
+            item.duration, self.t(guild_id, "unknown_duration")
+        )
+        thumbnail = item.get_thumbnail()
+        vol_pct = int(round(self.volume[guild_id] * 100))
+
+        if extra_added_count == 0:
+            fallback_text = self.t(
+                guild_id,
+                "playing_single",
+                name=song_name,
+                author=author,
+                added_by=added_by,
+                duration=duration_str,
+            )
+        else:
+            fallback_text = self.t(
+                guild_id,
+                "playing_multi",
+                name=song_name,
+                author=author,
+                added_by=added_by,
+                duration=duration_str,
+                count=extra_added_count,
+            )
+
+        fields = [
+            (self.t(guild_id, "field_author"), author, True),
+            (self.t(guild_id, "field_added_by"), added_by, True),
+            (self.t(guild_id, "field_duration"), duration_str, True),
+            (self.t(guild_id, "field_volume"), f"{vol_pct}%", True),
+        ]
+        if extra_added_count > 0:
+            fields.append(
+                (
+                    self.t(guild_id, "field_extra_tracks"),
+                    self.t(guild_id, "more_tracks_added", count=extra_added_count),
+                    False,
+                )
+            )
+
+        embed = self._create_embed(
+            title=self.t(guild_id, "player_embed_title"),
+            description=f"**{song_name}**",
+            color=0x57F287,
+            thumbnail=thumbnail,
+            fields=fields,
+        )
+        return fallback_text, embed
+
+    def build_added_to_queue_display(
+        self,
+        guild_id: int,
+        item: QueueItem,
+        total_added: int,
+        play_next: bool = False,
+    ) -> tuple[str, object]:
+        """Build Added-to-Queue Embed (no duplicate fields, image-only thumbnail, no player view)."""
+        self._apply_cached_metadata(item)
+        song_name = item.clean_title()
+        author = item.get_author(self.t(guild_id, "unknown_author"))
+        added_by = item.added_by or self.t(guild_id, "unknown_user")
+        duration_str = format_seconds(
+            item.duration, self.t(guild_id, "unknown_duration")
+        )
+        thumbnail = item.get_thumbnail()
+        extra_count = max(0, total_added - 1)
+        pos_label = self.t(guild_id, "pos_front" if play_next else "pos_end")
+
+        if extra_count == 0:
+            fallback_text = self.t(
+                guild_id,
+                "added_single",
+                pos=pos_label,
+                name=song_name,
+                author=author,
+                added_by=added_by,
+                duration=duration_str,
+            )
+        else:
+            fallback_text = self.t(
+                guild_id,
+                "added_multi",
+                pos=pos_label,
+                name=song_name,
+                author=author,
+                added_by=added_by,
+                duration=duration_str,
+                count=extra_count,
+            )
+
+        embed_title = self.t(
+            guild_id,
+            "added_next_embed_title" if play_next else "added_embed_title",
+        )
+        fields = [
+            (self.t(guild_id, "field_author"), author, True),
+            (self.t(guild_id, "field_added_by"), added_by, True),
+            (self.t(guild_id, "field_duration"), duration_str, True),
+        ]
+        if extra_count > 0:
+            fields.append(
+                (
+                    self.t(guild_id, "field_extra_tracks"),
+                    self.t(guild_id, "more_tracks_added", count=extra_count),
+                    False,
+                )
+            )
+
+        embed = self._create_embed(
+            title=embed_title,
+            description=f"**{song_name}**",
+            color=0x5865F2,
+            thumbnail=thumbnail,
+            fields=fields,
+        )
+        return fallback_text, embed
+
+    def build_playing_display(
+        self, guild_id: int, current_item: QueueItem
+    ) -> tuple[str, object]:
+        """Build %playing Embed with partially filled progress bar and image-only thumbnail."""
+        self._apply_cached_metadata(current_item)
+        duration = current_item.duration
+        if duration is None and current_item.local_path:
+            duration = probe_audio_duration(current_item.local_path)
+            current_item.duration = duration
+            if guild_id in self.playback_state:
+                self.playback_state[guild_id]["duration"] = duration
+
+        elapsed = self.get_current_playback_seconds(guild_id)
+        song_title = current_item.clean_title()
+        author = current_item.get_author(self.t(guild_id, "unknown_author"))
+        added_by = current_item.added_by or self.t(guild_id, "unknown_user")
+        thumbnail = current_item.get_thumbnail()
+        voice_client = self.voice_client.get(guild_id)
+        status_str = (
+            self.t(guild_id, "status_paused")
+            if getattr(voice_client, "is_paused", lambda: False)()
+            else self.t(guild_id, "status_playing")
+        )
+        elapsed_str = format_seconds(elapsed, self.t(guild_id, "unknown_duration"))
+        duration_str = format_seconds(duration, self.t(guild_id, "unknown_duration"))
+        bar = build_progress_bar(elapsed, duration)
+
+        fallback_text = self.t(
+            guild_id,
+            "now_playing_info",
+            title=song_title,
+            status=status_str,
+            author=author,
+            added_by=added_by,
+            bar=bar,
+            elapsed=elapsed_str,
+            duration=duration_str,
+        )
+
+        fields = [
+            (self.t(guild_id, "field_author"), author, True),
+            (self.t(guild_id, "field_added_by"), added_by, True),
+            (self.t(guild_id, "field_status"), status_str, True),
+            (
+                self.t(guild_id, "field_progress"),
+                f"`{bar}` `{elapsed_str} / {duration_str}`",
+                False,
+            ),
+        ]
+        embed = self._create_embed(
+            title=self.t(guild_id, "playing_embed_title"),
+            description=f"**{song_title}**",
+            color=0x5865F2,
+            thumbnail=thumbnail,
+            fields=fields,
+        )
+        return fallback_text, embed
+
+    def create_player_view(self, guild_id: int) -> PlayerView:
+        return PlayerView(self, guild_id)
+
+    async def _delete_player_message(self, guild_id: int):
+        old_msg = self.player_messages.pop(guild_id, None)
+        if old_msg is not None and hasattr(old_msg, "delete"):
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
+
+    async def recreate_player_message(self, guild_id: int, extra_added_count: int = 0):
+        """Delete previous interactive player message and create a new one at the bottom of the channel."""
+        await self._delete_player_message(guild_id)
+        current_item = self.now_playing_item.get(guild_id)
+        voice_client = self.voice_client.get(guild_id)
+        text_channel = self.last_text_channel.get(guild_id)
+        if (
+            current_item is None
+            or text_channel is None
+            or not self.is_guild_active(voice_client)
+        ):
+            return None
+
+        fallback_text, embed = self.build_player_display(
+            guild_id, current_item, extra_added_count=extra_added_count
+        )
+        player_view = self.create_player_view(guild_id)
+        sent = await self._safe_send(
+            text_channel,
+            None,
+            embed=embed,
+            view=player_view,
+            fallback_text=fallback_text,
+        )
+        self.player_messages[guild_id] = sent
+        return sent
+
+    async def _safe_send(
+        self,
+        text_channel,
+        content: str | None,
+        *,
+        embed=None,
+        view=None,
+        fallback_text: str | None = None,
+    ):
+        kwargs = {}
+        if embed is not None:
+            kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
+        if kwargs:
+            try:
+                if content is not None:
+                    return await text_channel.send(content, **kwargs)
+                return await text_channel.send(**kwargs)
+            except TypeError:
+                pass
+        text_to_send = content if content is not None else (fallback_text or "")
+        return await text_channel.send(text_to_send)
+
+    async def _safe_edit(
+        self,
+        status_msg,
+        content: str | None,
+        *,
+        embed=None,
+        view=None,
+        fallback_text: str | None = None,
+    ):
+        kwargs = {"content": content}
+        if embed is not None:
+            kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
+        try:
+            await status_msg.edit(**kwargs)
             return status_msg
-        return await text_channel.send(content)
+        except TypeError:
+            text_to_send = content if content is not None else (fallback_text or "")
+            await status_msg.edit(content=text_to_send)
+            return status_msg
+
+    async def _send_or_edit(
+        self,
+        text_channel,
+        status_msg,
+        content: str | None,
+        *,
+        embed=None,
+        view=None,
+        fallback_text: str | None = None,
+    ):
+        if status_msg is not None and hasattr(status_msg, "edit"):
+            return await self._safe_edit(
+                status_msg,
+                content,
+                embed=embed,
+                view=view,
+                fallback_text=fallback_text,
+            )
+        return await self._safe_send(
+            text_channel,
+            content,
+            embed=embed,
+            view=view,
+            fallback_text=fallback_text,
+        )
+
+    async def _respond_interaction(self, interaction, content: str):
+        resp = getattr(interaction, "response", None)
+        if resp is not None and hasattr(resp, "send_message"):
+            try:
+                if hasattr(resp, "is_done") and resp.is_done():
+                    followup = getattr(interaction, "followup", None)
+                    if followup is not None and hasattr(followup, "send"):
+                        return await followup.send(content, ephemeral=True)
+                return await resp.send_message(content, ephemeral=True)
+            except TypeError:
+                return await resp.send_message(content)
+        channel = getattr(interaction, "channel", None)
+        if channel is not None and hasattr(channel, "send"):
+            return await self._safe_send(channel, content)
+        return None
 
     async def handle_play_command(self, message, query: str, play_next: bool = False):
         text_channel = message.channel
         guild_id = text_channel.guild.id
+        self.last_text_channel[guild_id] = text_channel
         cmd_name = "%playnext" if play_next else "%play"
 
         if not query:
-            await text_channel.send(
-                f"""Usage:
-
-play by name ```{cmd_name} name_of_the_song```
-
-play by url(youtube) ```{cmd_name} https://youtube.com/```
-
-if name of the song is ended with '.opus' '.mp3' or similar, it is treated as a path to a file on host pc
-for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
-
-```%find name``` finds all local files that match name"""
-            )
+            await text_channel.send(self.t(guild_id, "play_usage", cmd_name=cmd_name))
             return
 
         voice_channel = await self.get_user_voice_channel(message)
@@ -1290,78 +1729,127 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             await text_channel.send(self.t(guild_id, "join_voice"))
             return
 
+        requester_name = (
+            getattr(message.author, "display_name", None)
+            or getattr(message.author, "name", None)
+            or str(message.author)
+        )
+
         voice_client = await self.get_voice_client(voice_channel)
         items_to_add: list[QueueItem] = []
         status_msg = None
 
-        if is_url(query):
-            norm_url = normalize_url(query)
-            cached = self.get_cached_download(norm_url)
-            if cached:
-                rel_name = os.path.relpath(cached, MUSIC_FOLDER).replace("\\", "/")
-                items_to_add.append(
-                    QueueItem(title=rel_name, local_path=cached, url=norm_url)
-                )
-            else:
-                status_msg = await text_channel.send(self.t(guild_id, "searching"))
-                entries = await asyncio.to_thread(
-                    self._extract_url_entries_sync, norm_url
-                )
-                if len(entries) > 1:
-                    # Playlist URL: add all individual song URLs to queue
-                    for entry in entries:
-                        entry_url = entry["url"]
-                        vid_id = entry.get("id")
-                        existing = self.get_cached_download(entry_url, vid_id)
-                        items_to_add.append(
-                            QueueItem(
+        try:
+            if is_url(query):
+                norm_url = normalize_url(query)
+                cached = self.get_cached_download(norm_url)
+                if cached:
+                    rel_name = os.path.relpath(cached, MUSIC_FOLDER).replace("\\", "/")
+                    item = QueueItem(
+                        title=rel_name,
+                        local_path=cached,
+                        url=norm_url,
+                        added_by=requester_name,
+                    )
+                    self._apply_cached_metadata(item)
+                    items_to_add.append(item)
+                else:
+                    search_text = self.t(guild_id, "searching", query=query)
+                    status_msg = await self._safe_send(
+                        text_channel,
+                        None,
+                        embed=self.build_searching_embed(guild_id, query),
+                        fallback_text=search_text,
+                    )
+                    entries = await asyncio.to_thread(
+                        self._extract_url_entries_sync, norm_url
+                    )
+                    if len(entries) > 1:
+                        # Playlist URL: add all individual song URLs to queue
+                        for entry in entries:
+                            entry_url = entry["url"]
+                            vid_id = entry.get("id")
+                            existing = self.get_cached_download(entry_url, vid_id)
+                            q_item = QueueItem(
                                 title=entry.get("title") or entry_url,
                                 local_path=existing,
                                 url=entry_url,
                                 video_id=vid_id,
                                 duration=entry.get("duration"),
+                                author=entry.get("author"),
+                                added_by=requester_name,
+                                thumbnail=entry.get("thumbnail"),
                             )
+                            self._apply_cached_metadata(q_item)
+                            items_to_add.append(q_item)
+                    else:
+                        # Single song URL: download as .opus (or reuse if already downloaded)
+                        entry = (
+                            entries[0]
+                            if entries
+                            else {
+                                "url": norm_url,
+                                "id": None,
+                                "title": norm_url,
+                                "duration": None,
+                                "author": None,
+                                "thumbnail": None,
+                            }
                         )
+                        item = QueueItem(
+                            title=entry.get("title") or norm_url,
+                            url=entry.get("url") or norm_url,
+                            video_id=entry.get("id"),
+                            duration=entry.get("duration"),
+                            author=entry.get("author"),
+                            added_by=requester_name,
+                            thumbnail=entry.get("thumbnail"),
+                        )
+                        await self.ensure_item_downloaded(item)
+                        items_to_add.append(item)
+            else:
+                # Search local music directory using %find matching rules
+                matches = find_matching_files(query, MUSIC_FOLDER)
+                if len(matches) == 1:
+                    match_path = matches[0]
+                    if match_path.lower().endswith(PLAYLIST_EXTENSION):
+                        items_to_add.extend(
+                            self.load_playlist_file(match_path, added_by=requester_name)
+                        )
+                    else:
+                        rel_name = os.path.relpath(match_path, MUSIC_FOLDER).replace(
+                            "\\", "/"
+                        )
+                        item = QueueItem(
+                            title=rel_name,
+                            local_path=match_path,
+                            added_by=requester_name,
+                        )
+                        self._apply_cached_metadata(item)
+                        items_to_add.append(item)
                 else:
-                    # Single song URL: download as .opus (or reuse if already downloaded)
-                    entry = (
-                        entries[0]
-                        if entries
-                        else {
-                            "url": norm_url,
-                            "id": None,
-                            "title": norm_url,
-                            "duration": None,
-                        }
+                    # 0 or multiple local matches: search on YouTube and download as .opus
+                    search_text = self.t(guild_id, "searching", query=query)
+                    status_msg = await self._safe_send(
+                        text_channel,
+                        None,
+                        embed=self.build_searching_embed(guild_id, query),
+                        fallback_text=search_text,
                     )
-                    item = QueueItem(
-                        title=entry.get("title") or norm_url,
-                        url=entry.get("url") or norm_url,
-                        video_id=entry.get("id"),
-                        duration=entry.get("duration"),
-                    )
+                    item = QueueItem(title=query, added_by=requester_name)
                     await self.ensure_item_downloaded(item)
                     items_to_add.append(item)
-        else:
-            # Search local music directory using %find matching rules
-            matches = find_matching_files(query, MUSIC_FOLDER)
-            if len(matches) == 1:
-                match_path = matches[0]
-                if match_path.lower().endswith(PLAYLIST_EXTENSION):
-                    items_to_add.extend(self.load_playlist_file(match_path))
-                else:
-                    rel_name = os.path.relpath(match_path, MUSIC_FOLDER).replace(
-                        "\\", "/"
-                    )
-                    items_to_add.append(
-                        QueueItem(title=rel_name, local_path=match_path)
-                    )
-            else:
-                # 0 or multiple local matches: search on YouTube and download as .opus
-                status_msg = await text_channel.send(self.t(guild_id, "searching"))
-                item = QueueItem(title=query)
-                await self.ensure_item_downloaded(item)
-                items_to_add.append(item)
+        except Exception as exc:
+            err_text = self.t(guild_id, "play_error", query=query, err=exc)
+            err_embed = self.build_error_embed(guild_id, query, exc)
+            await self._send_or_edit(
+                text_channel,
+                status_msg,
+                None,
+                embed=err_embed,
+                fallback_text=err_text,
+            )
+            return
 
         if not items_to_add:
             await self._send_or_edit(
@@ -1369,6 +1857,17 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             )
             return
 
+        batch_id = self._next_batch_id
+        self._next_batch_id += 1
+        for item in items_to_add:
+            if not item.added_by:
+                item.added_by = requester_name
+            item.batch_id = batch_id
+        self.play_batches[guild_id].append(batch_id)
+
+        was_queue_empty_and_inactive = (
+            not self.is_guild_active(voice_client) and len(self.queue[guild_id]) == 0
+        )
         self.enqueue_items(guild_id, items_to_add, play_next=play_next)
 
         if not self.is_guild_active(voice_client):
@@ -1377,39 +1876,442 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             self.trigger_background_downloads(guild_id)
             if not first_item.local_path or not os.path.isfile(first_item.local_path):
                 if status_msg is None:
-                    status_msg = await text_channel.send(self.t(guild_id, "searching"))
-                await self.ensure_item_downloaded(first_item)
+                    search_text = self.t(guild_id, "searching", query=first_item.title)
+                    status_msg = await self._safe_send(
+                        text_channel,
+                        None,
+                        embed=self.build_searching_embed(guild_id, first_item.title),
+                        fallback_text=search_text,
+                    )
+                try:
+                    await self.ensure_item_downloaded(first_item)
+                except Exception as exc:
+                    err_text = self.t(
+                        guild_id, "play_error", query=first_item.title, err=exc
+                    )
+                    err_embed = self.build_error_embed(guild_id, first_item.title, exc)
+                    await self._send_or_edit(
+                        text_channel,
+                        status_msg,
+                        None,
+                        embed=err_embed,
+                        fallback_text=err_text,
+                    )
+                    return
+
             self.play(voice_client, first_item)
-            if len(items_to_add) == 1:
-                final_text = self.t(
-                    guild_id, "playing_single", name=first_item.display_name()
-                )
-            else:
-                final_text = self.t(
+            if was_queue_empty_and_inactive:
+                await self._delete_player_message(guild_id)
+                fallback_text, embed = self.build_player_display(
                     guild_id,
-                    "playing_multi",
-                    name=first_item.display_name(),
-                    count=len(items_to_add) - 1,
+                    first_item,
+                    extra_added_count=max(0, len(items_to_add) - 1),
                 )
-            await self._send_or_edit(text_channel, status_msg, final_text)
+                player_view = self.create_player_view(guild_id)
+                sent = await self._send_or_edit(
+                    text_channel,
+                    status_msg,
+                    None,
+                    embed=embed,
+                    view=player_view,
+                    fallback_text=fallback_text,
+                )
+                self.player_messages[guild_id] = sent
         else:
+            # Song was added to queue while already playing: do NOT create a new player here
             self.trigger_background_downloads(guild_id)
-            position_label = self.t(guild_id, "pos_front" if play_next else "pos_end")
-            if len(items_to_add) == 1:
-                final_text = self.t(
+            primary_item = items_to_add[0]
+            fallback_text, embed = self.build_added_to_queue_display(
+                guild_id,
+                primary_item,
+                total_added=len(items_to_add),
+                play_next=play_next,
+            )
+            await self._send_or_edit(
+                text_channel,
+                status_msg,
+                None,
+                embed=embed,
+                view=None,
+                fallback_text=fallback_text,
+            )
+
+    def _record_item_in_history(self, guild_id: int, item: QueueItem | None):
+        if item is None:
+            return
+        self.history[guild_id].append(item.clone_for_queue())
+
+    async def execute_cancel(self, guild_id: int, recreate_player: bool = True) -> str:
+        """Remove all tracks from queue, history, and current playing song added in the latest %play."""
+        queue = self.queue[guild_id]
+        history = self.history[guild_id]
+        batches = self.play_batches[guild_id]
+        if not batches:
+            return self.t(guild_id, "cancel_empty")
+
+        while batches:
+            target_batch_id = batches.pop()
+            queue_removed = 0
+            history_removed = 0
+            current_removed = 0
+
+            remaining_queue: list[QueueItem] = []
+            for item in queue:
+                if getattr(item, "batch_id", None) == target_batch_id:
+                    queue_removed += 1
+                else:
+                    remaining_queue.append(item)
+            if queue_removed > 0:
+                queue.clear()
+                queue.extend(remaining_queue)
+
+            remaining_history: list[QueueItem] = []
+            for item in history:
+                if getattr(item, "batch_id", None) == target_batch_id:
+                    history_removed += 1
+                else:
+                    remaining_history.append(item)
+            if history_removed > 0:
+                history.clear()
+                history.extend(remaining_history)
+
+            current_item = self.now_playing_item.get(guild_id)
+            if (
+                current_item is not None
+                and getattr(current_item, "batch_id", None) == target_batch_id
+            ):
+                current_removed = 1
+                self.now_playing_item[guild_id] = None
+                self.now_playing[guild_id] = "None"
+                self.playback_state.pop(guild_id, None)
+                voice_client = self.voice_client.get(guild_id)
+                if voice_client and self.is_guild_active(voice_client):
+                    self._suppress_after.add(guild_id)
+                    try:
+                        voice_client.stop()
+                    finally:
+                        self._suppress_after.discard(guild_id)
+                await self._advance_queue_async(
                     guild_id,
-                    "added_single",
-                    pos=position_label,
-                    name=items_to_add[0].display_name(),
+                    record_previous=False,
+                    recreate_player=recreate_player,
                 )
-            else:
-                final_text = self.t(
+
+            total_removed = queue_removed + history_removed + current_removed
+            if total_removed > 0:
+                self.trigger_background_downloads(guild_id)
+                return self.t(
                     guild_id,
-                    "added_multi",
-                    count=len(items_to_add),
-                    pos=position_label,
+                    "cancel_done",
+                    count=total_removed,
+                    queue_count=queue_removed,
+                    history_count=history_removed,
+                    current_count=current_removed,
                 )
-            await self._send_or_edit(text_channel, status_msg, final_text)
+
+        return self.t(guild_id, "cancel_empty")
+
+    async def execute_remove(
+        self,
+        guild_id: int,
+        amount: int | None = None,
+        recreate_player: bool = True,
+    ) -> str:
+        """Remove current song (amount is None), upcoming songs from queue (amount > 0), or songs from history (amount < 0)."""
+        if amount is None:
+            current_item = self.now_playing_item.get(guild_id)
+            voice_client = self.voice_client.get(guild_id)
+            if current_item is None or not self.is_guild_active(voice_client):
+                return self.t(guild_id, "nothing_playing")
+
+            removed_name = current_item.clean_title()
+            self.now_playing_item[guild_id] = None
+            self.now_playing[guild_id] = "None"
+            self.playback_state.pop(guild_id, None)
+            self._suppress_after.add(guild_id)
+            try:
+                voice_client.stop()
+            finally:
+                self._suppress_after.discard(guild_id)
+
+            await self._advance_queue_async(
+                guild_id,
+                record_previous=False,
+                recreate_player=recreate_player,
+            )
+            return self.t(guild_id, "removed_current", name=removed_name)
+
+        if amount > 0:
+            queue = self.queue[guild_id]
+            if not queue:
+                return self.t(guild_id, "queue_empty")
+
+            actual_removed = min(amount, len(queue))
+            for _ in range(actual_removed):
+                queue.popleft()
+            self.trigger_background_downloads(guild_id)
+            return self.t(guild_id, "removed_n", count=actual_removed)
+
+        if amount < 0:
+            history = self.history[guild_id]
+            if not history:
+                return self.t(guild_id, "prev_empty")
+
+            actual_removed = min(abs(amount), len(history))
+            for _ in range(actual_removed):
+                history.pop()
+            return self.t(guild_id, "removed_history_n", count=actual_removed)
+
+        return self.t(guild_id, "remove_zero_err")
+
+    async def execute_skip(
+        self,
+        guild_id: int,
+        amount: int | None = 1,
+        recreate_player: bool = True,
+    ) -> str:
+        voice_client = self.voice_client.get(guild_id)
+        queue = self.queue[guild_id]
+        current_name = self.now_playing.get(guild_id, self.t(guild_id, "none_playing"))
+        current_item = self.now_playing_item.get(guild_id)
+
+        if amount is None or amount > len(queue):
+            if current_item is not None:
+                self._record_item_in_history(guild_id, current_item)
+            while queue:
+                skipped_item = queue.popleft()
+                self._record_item_in_history(guild_id, skipped_item)
+            self.trigger_background_downloads(guild_id)
+            self.now_playing[guild_id] = "None"
+            self.now_playing_item[guild_id] = None
+            self.playback_state.pop(guild_id, None)
+            if voice_client and self.is_guild_active(voice_client):
+                self._suppress_after.add(guild_id)
+                try:
+                    voice_client.stop()
+                finally:
+                    self._suppress_after.discard(guild_id)
+            await self._delete_player_message(guild_id)
+            return self.t(guild_id, "skip_cleared")
+
+        if current_item is not None:
+            self._record_item_in_history(guild_id, current_item)
+
+        # Skip (amount - 1) queued songs so the amount-th song in queue plays next
+        for _ in range(amount - 1):
+            if queue:
+                skipped_item = queue.popleft()
+                self._record_item_in_history(guild_id, skipped_item)
+
+        self.trigger_background_downloads(guild_id)
+        self.now_playing_item[guild_id] = None
+        if voice_client and self.is_guild_active(voice_client):
+            self._suppress_after.add(guild_id)
+            try:
+                voice_client.stop()
+            finally:
+                self._suppress_after.discard(guild_id)
+        await self._advance_queue_async(
+            guild_id, record_previous=False, recreate_player=recreate_player
+        )
+        return self.t(guild_id, "skipped_n", amount=amount, current=current_name)
+
+    async def execute_prev(
+        self,
+        guild_id: int,
+        amount: int = 1,
+        recreate_player: bool = True,
+    ) -> str:
+        history = self.history[guild_id]
+        if not history:
+            return self.t(guild_id, "prev_empty")
+
+        actual_amount = min(amount, len(history))
+        queue = self.queue[guild_id]
+
+        # Preserve currently playing song by placing it at the front of the queue first
+        current_item = self.now_playing_item.get(guild_id)
+        if current_item is not None:
+            queue.appendleft(current_item.clone_for_queue())
+
+        # Add specified amount of songs that already played back to the beginning of queue
+        for _ in range(actual_amount):
+            prev_item = history.pop()
+            queue.appendleft(prev_item)
+
+        self.trigger_background_downloads(guild_id)
+
+        voice_client = self.voice_client.get(guild_id)
+        self.now_playing_item[guild_id] = None
+        if voice_client and self.is_guild_active(voice_client):
+            self._suppress_after.add(guild_id)
+            try:
+                voice_client.stop()
+            finally:
+                self._suppress_after.discard(guild_id)
+
+        await self._advance_queue_async(
+            guild_id, record_previous=False, recreate_player=recreate_player
+        )
+        now_item = self.now_playing_item.get(guild_id)
+        now_name = (
+            now_item.display_name(MUSIC_FOLDER)
+            if now_item is not None
+            else self.now_playing.get(guild_id, self.t(guild_id, "none_playing"))
+        )
+        return self.t(guild_id, "prev_played", amount=actual_amount, name=now_name)
+
+    async def execute_seek(self, guild_id: int, delta_seconds: float) -> str:
+        current_item = self.now_playing_item.get(guild_id)
+        voice_client = self.voice_client.get(guild_id)
+        if current_item is None or not self.is_guild_active(voice_client):
+            return self.t(guild_id, "nothing_playing")
+
+        if current_item.duration is None and current_item.local_path:
+            current_item.duration = probe_audio_duration(current_item.local_path)
+
+        elapsed = self.get_current_playback_seconds(guild_id)
+        new_pos = max(0.0, elapsed + delta_seconds)
+        if current_item.duration is not None and current_item.duration > 0:
+            new_pos = min(new_pos, float(current_item.duration))
+
+        was_paused = getattr(voice_client, "is_paused", lambda: False)()
+        self._suppress_after.add(guild_id)
+        try:
+            voice_client.stop()
+            self.play(
+                voice_client,
+                current_item,
+                start_at=new_pos,
+                record_history=False,
+            )
+            if was_paused and hasattr(voice_client, "pause"):
+                voice_client.pause()
+                if guild_id in self.playback_state:
+                    self.playback_state[guild_id]["pause_start"] = time.monotonic()
+        finally:
+            self._suppress_after.discard(guild_id)
+
+        if float(delta_seconds).is_integer():
+            delta_num = int(delta_seconds)
+            delta_str = f"+{delta_num}" if delta_num >= 0 else str(delta_num)
+        else:
+            delta_str = (
+                f"+{delta_seconds}" if delta_seconds >= 0 else str(delta_seconds)
+            )
+
+        unknown_dur = self.t(guild_id, "unknown_duration")
+        return self.t(
+            guild_id,
+            "seeked_to",
+            delta=delta_str,
+            elapsed=format_seconds(new_pos, unknown_dur),
+            duration=format_seconds(current_item.duration, unknown_dur),
+        )
+
+    async def execute_leave(self, guild_id: int) -> str:
+        voice_client = self.voice_client.get(guild_id)
+        if voice_client is None or not voice_client.is_connected():
+            return self.t(guild_id, "not_in_voice")
+        if self.is_guild_active(voice_client):
+            self._suppress_after.add(guild_id)
+            try:
+                voice_client.stop()
+            finally:
+                self._suppress_after.discard(guild_id)
+        await voice_client.disconnect()
+        self.voice_client.pop(guild_id, None)
+        self.now_playing[guild_id] = "None"
+        self.now_playing_item[guild_id] = None
+        self.playback_state.pop(guild_id, None)
+        await self._delete_player_message(guild_id)
+        return self.t(guild_id, "left_voice")
+
+    def format_queue_page(self, guild_id: int, page: int = 1) -> str:
+        queue = self.queue[guild_id]
+        if not queue:
+            return self.t(guild_id, "queue_empty")
+
+        if page <= 0:
+            page = 1
+        per_page = 10
+        total_pages = (len(queue) - 1) // per_page + 1
+        start_idx = (page - 1) * per_page
+        end_idx = min(page * per_page, len(queue))
+        queue_list = list(queue)
+
+        msg = self.t(
+            guild_id,
+            "queue_header",
+            page=page,
+            total_pages=total_pages,
+            total=len(queue),
+        )
+        for i in range(start_idx, end_idx):
+            item = queue_list[i]
+            name = item.display_name() if isinstance(item, QueueItem) else str(item)
+            msg += f"{i + 1}. {name}\n\n"
+
+        if page < total_pages:
+            msg += self.t(guild_id, "queue_next", next_page=page + 1)
+
+        return msg
+
+    def format_history_page(self, guild_id: int, page: int = 1) -> str:
+        history = self.history[guild_id]
+        if not history:
+            return self.t(guild_id, "history_empty")
+
+        if page <= 0:
+            page = 1
+        per_page = 10
+        total_pages = (len(history) - 1) // per_page + 1
+        start_idx = (page - 1) * per_page
+        end_idx = min(page * per_page, len(history))
+        history_list = list(history)
+
+        msg = self.t(
+            guild_id,
+            "history_header",
+            page=page,
+            total_pages=total_pages,
+            total=len(history),
+        )
+        for i in range(start_idx, end_idx):
+            item = history_list[i]
+            name = item.display_name() if isinstance(item, QueueItem) else str(item)
+            msg += f"{i + 1}. {name}\n\n"
+
+        if page < total_pages:
+            msg += self.t(guild_id, "history_next", next_page=page + 1)
+
+        return msg
+
+    def format_help_page(self, guild_id: int, page: int = 1) -> str:
+        lang = self.language.get(guild_id, "en")
+        help_table = COMMAND_HELP.get(lang, COMMAND_HELP["en"])
+        total_pages = 2
+        if page < 1:
+            page = 1
+        elif page > total_pages:
+            page = total_pages
+
+        if page == 1:
+            keys = [k for k in HELP_PAGE_1_COMMANDS if k in help_table]
+        else:
+            page1_set = set(HELP_PAGE_1_COMMANDS)
+            keys = [
+                k for k in help_table.keys() if k != "volume" and k not in page1_set
+            ]
+
+        lines = [self.t(guild_id, "help_header", page=page, total_pages=total_pages)]
+        for cmd_key in keys:
+            info = help_table[cmd_key]
+            lines.append(f"`{info['usage']}` — {info['short']}")
+        lines.append(self.t(guild_id, "help_footer"))
+        if page < total_pages:
+            lines.append(self.t(guild_id, "help_next", next_page=page + 1))
+        return "\n".join(lines)
 
     def get_current_playback_seconds(self, guild_id: int) -> float:
         state = self.playback_state.get(guild_id)
@@ -1435,6 +2337,7 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
         if not q.startswith("%"):
             return
 
+        self.last_text_channel[guild_id] = text_channel
         parts = q.split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
@@ -1442,17 +2345,21 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
         if cmd == "%help":
             lang = self.language.get(guild_id, "en")
             help_table = COMMAND_HELP.get(lang, COMMAND_HELP["en"])
-            target = arg.strip().lstrip("%").lower()
-            if not target:
-                lines = [self.t(guild_id, "help_header")]
-                for cmd_key, info in help_table.items():
-                    if cmd_key == "volume":
-                        continue
-                    lines.append(f"`{info['usage']}` — {info['short']}")
-                lines.append(self.t(guild_id, "help_footer"))
-                await text_channel.send("\n".join(lines))
+            raw_target = arg.strip()
+            if raw_target.startswith("--page"):
+                raw_target = raw_target.removeprefix("--page").strip()
+
+            if not raw_target:
+                await text_channel.send(self.format_help_page(guild_id, page=1))
                 return
 
+            if raw_target.isdigit():
+                await text_channel.send(
+                    self.format_help_page(guild_id, page=int(raw_target))
+                )
+                return
+
+            target = raw_target.lstrip("%").lower()
             if target not in help_table:
                 await text_channel.send(self.t(guild_id, "help_unknown", cmd=target))
                 return
@@ -1475,40 +2382,25 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             current_item = self.now_playing_item.get(guild_id)
             voice_client = self.voice_client.get(guild_id)
             if current_item is None or not self.is_guild_active(voice_client):
+                last_name = self.now_playing.get(guild_id)
+                if not last_name or last_name == "None":
+                    last_name = self.t(guild_id, "none_playing")
                 await text_channel.send(
                     self.t(
                         guild_id,
                         "now_playing_none",
-                        name=self.now_playing.get(guild_id, "None"),
+                        name=last_name,
                     )
                 )
                 return
 
-            filename = current_item.display_name()
-            duration = current_item.duration
-            if duration is None and current_item.local_path:
-                duration = probe_audio_duration(current_item.local_path)
-                current_item.duration = duration
-                if guild_id in self.playback_state:
-                    self.playback_state[guild_id]["duration"] = duration
-
-            elapsed = self.get_current_playback_seconds(guild_id)
-            song_title = os.path.splitext(os.path.basename(filename))[0]
-            status_str = (
-                self.t(guild_id, "status_paused")
-                if getattr(voice_client, "is_paused", lambda: False)()
-                else self.t(guild_id, "status_playing")
-            )
-            await text_channel.send(
-                self.t(
-                    guild_id,
-                    "now_playing_info",
-                    title=song_title,
-                    status=status_str,
-                    filename=filename,
-                    elapsed=format_seconds(elapsed),
-                    duration=format_seconds(duration),
-                )
+            fallback_text, embed = self.build_playing_display(guild_id, current_item)
+            await self._safe_send(
+                text_channel,
+                None,
+                embed=embed,
+                view=None,
+                fallback_text=fallback_text,
             )
             return
 
@@ -1518,6 +2410,85 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
 
         if cmd == "%playnext":
             await self.handle_play_command(message, arg.strip(), play_next=True)
+            return
+
+        if cmd == "%cancel":
+            prev_current = self.now_playing_item.get(guild_id)
+            reply = await self.execute_cancel(guild_id, recreate_player=False)
+            await text_channel.send(reply)
+            if self.now_playing_item.get(guild_id) is not prev_current:
+                if self.now_playing_item.get(guild_id) is not None:
+                    await self.recreate_player_message(guild_id)
+                else:
+                    await self._delete_player_message(guild_id)
+            return
+
+        if cmd == "%remove":
+            rem_arg = arg.strip()
+            if not rem_arg:
+                reply = await self.execute_remove(
+                    guild_id, amount=None, recreate_player=False
+                )
+                await text_channel.send(reply)
+                if self.now_playing_item.get(guild_id) is not None:
+                    await self.recreate_player_message(guild_id)
+                else:
+                    await self._delete_player_message(guild_id)
+                return
+            try:
+                amount = int(rem_arg)
+                if amount == 0:
+                    await text_channel.send(self.t(guild_id, "remove_zero_err"))
+                    return
+            except ValueError:
+                await text_channel.send(self.t(guild_id, "remove_invalid"))
+                return
+
+            reply = await self.execute_remove(
+                guild_id, amount=amount, recreate_player=False
+            )
+            await text_channel.send(reply)
+            return
+
+        if cmd == "%prev":
+            voice_channel = await self.get_user_voice_channel(message)
+            voice_client = self.voice_client.get(guild_id)
+            if voice_client is None and voice_channel is not None:
+                voice_client = await self.get_voice_client(voice_channel)
+
+            prev_arg = arg.strip()
+            if not prev_arg:
+                amount = 1
+            else:
+                try:
+                    amount = int(prev_arg)
+                    if amount <= 0:
+                        await text_channel.send(self.t(guild_id, "prev_pos_err"))
+                        return
+                except ValueError:
+                    await text_channel.send(self.t(guild_id, "prev_invalid"))
+                    return
+
+            reply = await self.execute_prev(
+                guild_id, amount=amount, recreate_player=False
+            )
+            await text_channel.send(reply)
+            await self.recreate_player_message(guild_id)
+            return
+
+        if cmd == "%seek":
+            seek_arg = arg.strip().removesuffix("s").strip()
+            if not seek_arg:
+                await text_channel.send(self.t(guild_id, "seek_usage"))
+                return
+            try:
+                seconds = float(seek_arg)
+            except ValueError:
+                await text_channel.send(self.t(guild_id, "seek_invalid"))
+                return
+
+            reply = await self.execute_seek(guild_id, seconds)
+            await text_channel.send(reply)
             return
 
         if cmd == "%download":
@@ -1637,7 +2608,6 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             if voice_client is None and voice_channel is not None:
                 voice_client = await self.get_voice_client(voice_channel)
 
-            queue = self.queue[guild_id]
             skip_arg = arg.strip().lower()
 
             if skip_arg == "":
@@ -1654,31 +2624,12 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
                     await text_channel.send(self.t(guild_id, "skip_invalid"))
                     return
 
-            current_name = self.now_playing.get(guild_id, "None")
-
-            if amount is None or amount > len(queue):
-                queue.clear()
-                self.trigger_background_downloads(guild_id)
-                self.now_playing[guild_id] = "None"
-                self.now_playing_item[guild_id] = None
-                self.playback_state.pop(guild_id, None)
-                if voice_client and self.is_guild_active(voice_client):
-                    voice_client.stop()
-                await text_channel.send(self.t(guild_id, "skip_cleared"))
-                return
-
-            # Skip (amount - 1) queued songs so the amount-th song in queue plays next
-            for _ in range(amount - 1):
-                if queue:
-                    queue.popleft()
-
-            self.trigger_background_downloads(guild_id)
-            if voice_client and self.is_guild_active(voice_client):
-                voice_client.stop()
-            await self._advance_queue_async(guild_id)
-            await text_channel.send(
-                self.t(guild_id, "skipped_n", amount=amount, current=current_name)
+            reply = await self.execute_skip(
+                guild_id, amount=amount, recreate_player=False
             )
+            await text_channel.send(reply)
+            if self.now_playing_item.get(guild_id) is not None:
+                await self.recreate_player_message(guild_id)
             return
 
         if cmd == "%queue":
@@ -1702,26 +2653,31 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             if page <= 0:
                 page = 1
 
-            queue = self.queue[guild_id]
-            if not queue:
-                await text_channel.send(self.t(guild_id, "queue_empty"))
+            msg = self.format_queue_page(guild_id, page=page)
+            await text_channel.send(msg)
+            return
+
+        if cmd == "%history":
+            raw_arg = arg.strip()
+            if raw_arg.lower() == "clear":
+                self.history[guild_id].clear()
+                await text_channel.send(self.t(guild_id, "history_cleared"))
                 return
 
-            per_page = 10
-            total_pages = (len(queue) - 1) // per_page + 1
-            start_idx = (page - 1) * per_page
-            end_idx = min(page * per_page, len(queue))
-            queue_list = list(queue)
+            if raw_arg.startswith("--page"):
+                raw_arg = raw_arg.removeprefix("--page").strip()
 
-            msg = f"Page {page}/{total_pages}\n"
-            for i in range(start_idx, end_idx):
-                item = queue_list[i]
-                name = item.display_name() if isinstance(item, QueueItem) else str(item)
-                msg += f"{i + 1}. {name}\n\n"
+            page = 1
+            if raw_arg:
+                if raw_arg.isdigit():
+                    page = int(raw_arg)
+                else:
+                    await text_channel.send(self.t(guild_id, "history_usage"))
+                    return
+            if page <= 0:
+                page = 1
 
-            if page < total_pages:
-                msg += self.t(guild_id, "queue_next", next_page=page + 1)
-
+            msg = self.format_history_page(guild_id, page=page)
             await text_channel.send(msg)
             return
 
@@ -1739,18 +2695,8 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             return
 
         if cmd == "%leave":
-            voice_client = self.voice_client.get(guild_id)
-            if voice_client is None or not voice_client.is_connected():
-                await text_channel.send(self.t(guild_id, "not_in_voice"))
-                return
-            if self.is_guild_active(voice_client):
-                voice_client.stop()
-            await voice_client.disconnect()
-            self.voice_client.pop(guild_id, None)
-            self.now_playing[guild_id] = "None"
-            self.now_playing_item[guild_id] = None
-            self.playback_state.pop(guild_id, None)
-            await text_channel.send(self.t(guild_id, "left_voice"))
+            reply = await self.execute_leave(guild_id)
+            await text_channel.send(reply)
             return
 
         if cmd == "%pause":
@@ -1796,24 +2742,18 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
                 return
             try:
                 percentage = float(vol_str)
-                if percentage < 0:
+                if percentage < MIN_VOLUME_PERCENT:
                     await text_channel.send(self.t(guild_id, "vol_neg"))
+                    return
+                if percentage > MAX_VOLUME_PERCENT:
+                    await text_channel.send(self.t(guild_id, "vol_max"))
                     return
             except ValueError:
                 await text_channel.send(self.t(guild_id, "vol_invalid", cmd=cmd))
                 return
 
-            self.volume[guild_id] = percentage / 100.0
-            self.save_volumes()
-            voice_client = self.voice_client.get(guild_id)
-            if (
-                voice_client is not None
-                and getattr(voice_client, "source", None) is not None
-            ):
-                if hasattr(voice_client.source, "volume"):
-                    voice_client.source.volume = self.volume[guild_id]
-
-            display_pct = int(percentage) if percentage.is_integer() else percentage
+            applied = self.set_guild_volume(guild_id, percentage)
+            display_pct = int(applied) if applied.is_integer() else applied
             await text_channel.send(self.t(guild_id, "vol_set", vol=display_pct))
             return
 
@@ -1853,18 +2793,29 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             )
             return
 
-    async def _advance_queue_async(self, guild_id: int):
+    async def _advance_queue_async(
+        self,
+        guild_id: int,
+        record_previous: bool = True,
+        recreate_player: bool = True,
+    ):
         async with self.play_locks[guild_id]:
             voice_client = self.voice_client.get(guild_id)
             if voice_client is None or not voice_client.is_connected():
                 return
             if self.is_guild_active(voice_client):
                 return
+
+            if record_previous and self.now_playing_item.get(guild_id) is not None:
+                self._record_item_in_history(guild_id, self.now_playing_item[guild_id])
+                self.now_playing_item[guild_id] = None
+
             queue = self.queue.get(guild_id)
             if not queue:
                 self.now_playing[guild_id] = "None"
                 self.now_playing_item[guild_id] = None
                 self.playback_state.pop(guild_id, None)
+                await self._delete_player_message(guild_id)
                 return
 
             next_item = queue.popleft()
@@ -1875,32 +2826,63 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
                     local_path=next_item,
                 )
             await self.ensure_item_downloaded(next_item)
-            self.play(voice_client, next_item)
+            self.play(voice_client, next_item, record_history=False)
+            if recreate_player:
+                await self.recreate_player_message(guild_id)
 
     def play_next_song_in_queue(self, error=None):
         if error is not None:
             raise error
 
         for v in list(self.voice_clients):
+            guild_id = v.guild.id
+            if guild_id in self._suppress_after:
+                continue
             if not self.is_guild_active(v):
-                guild_id = v.guild.id
                 queue = self.queue.get(guild_id)
+                loop = getattr(self, "loop", None)
                 if queue:
-                    loop = getattr(self, "loop", None)
                     if loop and loop.is_running():
                         asyncio.run_coroutine_threadsafe(
-                            self._advance_queue_async(guild_id), loop
+                            self._advance_queue_async(
+                                guild_id,
+                                record_previous=True,
+                                recreate_player=True,
+                            ),
+                            loop,
                         )
                     else:
+                        if self.now_playing_item.get(guild_id) is not None:
+                            self._record_item_in_history(
+                                guild_id, self.now_playing_item[guild_id]
+                            )
+                            self.now_playing_item[guild_id] = None
                         item = queue.popleft()
-                        self.play(v, item)
+                        self.play(v, item, record_history=False)
                 else:
+                    if self.now_playing_item.get(guild_id) is not None:
+                        self._record_item_in_history(
+                            guild_id, self.now_playing_item[guild_id]
+                        )
                     self.now_playing[guild_id] = "None"
                     self.now_playing_item[guild_id] = None
                     self.playback_state.pop(guild_id, None)
+                    if loop and loop.is_running():
+                        asyncio.run_coroutine_threadsafe(
+                            self._delete_player_message(guild_id), loop
+                        )
 
-    def play(self, voice_client, item_or_path: QueueItem | str):
+    def play(
+        self,
+        voice_client,
+        item_or_path: QueueItem | str,
+        start_at: float = 0.0,
+        record_history: bool = False,
+    ):
         guild_id = voice_client.guild.id
+        if record_history and self.now_playing_item.get(guild_id) is not None:
+            self._record_item_in_history(guild_id, self.now_playing_item[guild_id])
+
         if isinstance(item_or_path, str):
             path = item_or_path
             rel_name = (
@@ -1913,11 +2895,26 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
             item = item_or_path
             path = item.local_path
 
+        self._apply_cached_metadata(item)
         if item.duration is None and path:
             item.duration = probe_audio_duration(path)
 
-        raw_audio = discord.FFmpegPCMAudio(path)
-        vol = self.volume[guild_id]
+        start_offset = max(0.0, float(start_at))
+        if start_offset > 0:
+            try:
+                raw_audio = discord.FFmpegPCMAudio(
+                    path, before_options=f"-ss {start_offset}"
+                )
+            except TypeError:
+                raw_audio = discord.FFmpegPCMAudio(path)
+        else:
+            raw_audio = discord.FFmpegPCMAudio(path)
+
+        vol = max(
+            MIN_VOLUME_PERCENT / 100.0,
+            min(MAX_VOLUME_PERCENT / 100.0, self.volume[guild_id]),
+        )
+        self.volume[guild_id] = vol
         audio = discord.PCMVolumeTransformer(raw_audio, volume=vol)
         voice_client.play(audio, after=self.play_next_song_in_queue)
 
@@ -1925,7 +2922,7 @@ for example ```{cmd_name} Theta.wav``` will play file Theta.wav from host pc
         self.now_playing[guild_id] = display_name
         self.now_playing_item[guild_id] = item
         self.playback_state[guild_id] = {
-            "start_time": time.monotonic(),
+            "start_time": time.monotonic() - start_offset,
             "paused_total": 0.0,
             "pause_start": None,
             "duration": item.duration,
