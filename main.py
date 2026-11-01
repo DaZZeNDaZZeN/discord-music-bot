@@ -6,6 +6,7 @@ import os
 import random
 import re
 import subprocess
+import threading
 import time
 from urllib.parse import urlparse
 import discord
@@ -1335,6 +1336,18 @@ class MyClient(discord.Client):
     def is_guild_active(self, voice_client: discord.VoiceClient | None) -> bool:
         if voice_client is None:
             return False
+        is_connected_fn = getattr(voice_client, "is_connected", None)
+        if callable(is_connected_fn) and not is_connected_fn():
+            return False
+        player = getattr(voice_client, "_player", None)
+        if player is not None:
+            is_alive_fn = getattr(player, "is_alive", None)
+            if callable(is_alive_fn) and not is_alive_fn():
+                try:
+                    voice_client.stop()
+                except Exception:
+                    pass
+                return False
         is_playing = getattr(voice_client, "is_playing", lambda: False)()
         is_paused = getattr(voice_client, "is_paused", lambda: False)()
         return bool(is_playing or is_paused)
@@ -1895,6 +1908,11 @@ class MyClient(discord.Client):
                 fallback_text=card_text,
             )
 
+            is_connected_fn = getattr(voice_client, "is_connected", None)
+            if voice_client is None or (
+                callable(is_connected_fn) and not is_connected_fn()
+            ):
+                voice_client = await self.get_voice_client(voice_channel)
             self.play(voice_client, first_item)
             if was_queue_empty_and_inactive:
                 await self.recreate_player_message(guild_id)
@@ -2806,8 +2824,28 @@ class MyClient(discord.Client):
     ):
         async with self.play_locks[guild_id]:
             voice_client = self.voice_client.get(guild_id)
-            if voice_client is None or not voice_client.is_connected():
+            if voice_client is None:
                 return
+            if not voice_client.is_connected():
+                channel = getattr(voice_client, "channel", None)
+                if channel is not None and self.queue.get(guild_id):
+                    try:
+                        voice_client = await self.get_voice_client(channel)
+                    except Exception:
+                        return
+                else:
+                    if (
+                        record_previous
+                        and self.now_playing_item.get(guild_id) is not None
+                    ):
+                        self._record_item_in_history(
+                            guild_id, self.now_playing_item[guild_id]
+                        )
+                    self.now_playing[guild_id] = "None"
+                    self.now_playing_item[guild_id] = None
+                    self.playback_state.pop(guild_id, None)
+                    await self._delete_player_message(guild_id)
+                    return
             if self.is_guild_active(voice_client):
                 return
 
@@ -2831,6 +2869,10 @@ class MyClient(discord.Client):
                     local_path=next_item,
                 )
             await self.ensure_item_downloaded(next_item)
+            if not voice_client.is_connected():
+                channel = getattr(voice_client, "channel", None)
+                if channel is not None:
+                    voice_client = await self.get_voice_client(channel)
             self.play(voice_client, next_item, record_history=False)
             if recreate_player:
                 await self.recreate_player_message(guild_id)
@@ -2839,10 +2881,20 @@ class MyClient(discord.Client):
         if error is not None:
             raise error
 
+        current_thread = threading.current_thread()
         for v in list(self.voice_clients):
             guild_id = v.guild.id
             if guild_id in self._suppress_after:
                 continue
+            player = getattr(v, "_player", None)
+            if player is not None and player is current_thread:
+                end_event = getattr(player, "_end", None)
+                if end_event is not None and not end_event.is_set():
+                    try:
+                        v.stop()
+                    except Exception:
+                        pass
+
             if not self.is_guild_active(v):
                 queue = self.queue.get(guild_id)
                 loop = getattr(self, "loop", None)
@@ -2904,6 +2956,15 @@ class MyClient(discord.Client):
         if item.duration is None and path:
             item.duration = probe_audio_duration(path)
 
+        player = getattr(voice_client, "_player", None)
+        if player is not None:
+            is_alive_fn = getattr(player, "is_alive", None)
+            if callable(is_alive_fn) and not is_alive_fn():
+                try:
+                    voice_client.stop()
+                except Exception:
+                    pass
+
         start_offset = max(0.0, float(start_at))
         if start_offset > 0:
             try:
@@ -2933,11 +2994,92 @@ class MyClient(discord.Client):
             "duration": item.duration,
         }
 
+    async def _cleanup_voice_client(self, guild_id: int, guild=None):
+        candidates = []
+        tracked = self.voice_client.get(guild_id)
+        if tracked is not None:
+            candidates.append(tracked)
+        if guild is not None:
+            guild_vc = getattr(guild, "voice_client", None)
+            if guild_vc is not None and all(guild_vc is not c for c in candidates):
+                candidates.append(guild_vc)
+
+        for vc in candidates:
+            self._suppress_after.add(guild_id)
+            try:
+                vc.stop()
+            except Exception:
+                pass
+            finally:
+                self._suppress_after.discard(guild_id)
+
+            conn = getattr(vc, "_connection", None)
+            if conn is not None:
+                for task_attr in ("_connector", "_runner"):
+                    task = getattr(conn, task_attr, None)
+                    if task is not None and hasattr(task, "cancel"):
+                        try:
+                            task.cancel()
+                        except Exception:
+                            pass
+                try:
+                    conn.timeout = min(getattr(conn, "timeout", 2.0) or 2.0, 2.0)
+                except Exception:
+                    pass
+
+            try:
+                await vc.disconnect(force=True)
+            except TypeError:
+                try:
+                    await vc.disconnect()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+            if hasattr(vc, "cleanup"):
+                try:
+                    vc.cleanup()
+                except Exception:
+                    pass
+
+        state = getattr(self, "_connection", None)
+        if state is not None and hasattr(state, "_remove_voice_client"):
+            try:
+                state._remove_voice_client(guild_id)
+            except Exception:
+                pass
+
+        self.voice_client.pop(guild_id, None)
+
     async def get_voice_client(self, voice_channel):
-        voice_client = self.voice_client.get(voice_channel.guild.id, None)
-        if voice_client is None or not voice_client.is_connected():
+        guild = voice_channel.guild
+        guild_id = guild.id
+        voice_client = self.voice_client.get(guild_id, None)
+        guild_vc = getattr(guild, "voice_client", None)
+        if voice_client is None and guild_vc is not None:
+            voice_client = guild_vc
+
+        if voice_client is not None and voice_client.is_connected():
+            self.voice_client[guild_id] = voice_client
+            if voice_client.channel != voice_channel:
+                try:
+                    await voice_client.move_to(voice_channel)
+                except Exception:
+                    pass
+            if voice_client.is_connected():
+                return voice_client
+
+        if voice_client is not None or guild_vc is not None:
+            await self._cleanup_voice_client(guild_id, guild)
+
+        try:
             voice_client = await voice_channel.connect()
-            self.voice_client[voice_channel.guild.id] = voice_client
+        except discord.ClientException:
+            await self._cleanup_voice_client(guild_id, guild)
+            voice_client = await voice_channel.connect()
+
+        self.voice_client[guild_id] = voice_client
 
         if voice_client.channel != voice_channel:
             await voice_client.move_to(voice_channel)
