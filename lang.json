@@ -96,6 +96,11 @@
         "short": "Downloads all queued URLs and replaces them in the queue with local paths.",
         "long": "Downloads every remaining URL item in the queue to `.opus` files on disk and replaces all URLs in the queue with their local file paths. Reports if an error stops the download.\n\n**Examples:**\n```%download```"
       },
+      "lyrics": {
+        "usage": "%lyrics [name]",
+        "short": "Fetches and displays song lyrics from LRCLIB (or local disk cache) for the current or specified song.",
+        "long": "Without arguments (`%lyrics`), searches for lyrics of the currently playing song. With `<name>` (`%lyrics <name>`), searches for lyrics of the specified song (supports song name with or without author, even when not separated by `-`). Found lyrics are saved to disk in the music folder and loaded from disk on subsequent requests.\n\n**Examples:**\n```%lyrics```\n```%lyrics Bohemian Rhapsody```\n```%lyrics Queen Bohemian Rhapsody```\n```%lyrics Rick Astley - Never Gonna Give You Up```"
+      },
       "lang": {
         "usage": "%lang <en|ru>",
         "short": "Changes the bot language in this server to English (en) or Russian (ru).",
@@ -203,6 +208,11 @@
         "short": "Скачивает все песни из очереди и заменяет ссылки на локальные пути.",
         "long": "Скачивает все оставшиеся ссылки в очереди в формат `.opus` и заменяет ссылки в очереди на локальные пути к файлам. В случае ошибки сообщает, сколько песен удалось скачать и на какой произошла ошибка.\n\n**Примеры:**\n```%download```"
       },
+      "lyrics": {
+        "usage": "%lyrics [название]",
+        "short": "Ищет и отправляет текст текущей или указанной песни через LRCLIB (с кэшированием на диск).",
+        "long": "Без аргументов (`%lyrics`) ищет текст текущей играющей песни. С аргументом (`%lyrics <название>`) ищет текст указанной песни (название может содержать автора даже без разделителя `-`). Найденные тексты песен сохраняются на диск и при повторных запросах загружаются с диска.\n\n**Примеры:**\n```%lyrics```\n```%lyrics Bohemian Rhapsody```\n```%lyrics Queen Bohemian Rhapsody```\n```%lyrics Кино Группа крови```"
+      },
       "lang": {
         "usage": "%lang <en|ru>",
         "short": "Меняет язык бота на сервере на английский (en) или русский (ru).",
@@ -303,6 +313,9 @@
       "save_usage": "Usage: `%save <name>`",
       "save_empty": "Nothing is playing and queue is empty.",
       "saved_playlist": "Saved {count} song(s) to playlist `{name}`.",
+      "lyrics_header": "📜 **Lyrics — {title}**\n\n{lyrics}",
+      "lyrics_header_with_artist": "📜 **Lyrics — {artist} - {title}**\n\n{lyrics}",
+      "lyrics_not_found": "Lyrics could not be found for **{query}**.",
       "lang_usage": "Usage: `%lang <en|ru>`",
       "lang_set": "Language set to English (`en`).",
       "help_header": "📖 **Available Commands (Page {page}/{total_pages}):**\n",
@@ -413,6 +426,9 @@
       "save_usage": "Использование: `%save <name>`",
       "save_empty": "Сейчас ничего не играет и очередь пуста.",
       "saved_playlist": "Сохранено {count} песен(и) в плейлист `{name}`.",
+      "lyrics_header": "📜 **Текст песни — {title}**\n\n{lyrics}",
+      "lyrics_header_with_artist": "📜 **Текст песни — {artist} - {title}**\n\n{lyrics}",
+      "lyrics_not_found": "Не удалось найти текст песни для **{query}**.",
       "lang_usage": "Использование: `%lang <en|ru>`",
       "lang_set": "Язык бота изменён на русский (`ru`).",
       "help_header": "📖 **Список доступных команд (Страница {page}/{total_pages}):**\n",

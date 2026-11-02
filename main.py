@@ -8,7 +8,9 @@ import re
 import subprocess
 import threading
 import time
-from urllib.parse import urlparse
+import urllib.error
+from urllib.parse import urlencode, urlparse
+import urllib.request
 import discord
 import yt_dlp
 
@@ -17,6 +19,10 @@ URL_MAP_FILENAME = "url_map.json"
 VOLUME_MAP_FILENAME = "volumes.json"
 LANG_MAP_FILENAME = "languages.json"
 LANG_DATA_FILENAME = "lang.json"
+LYRICS_MAP_FILENAME = "lyrics_map.json"
+LYRICS_FOLDER_NAME = "lyrics"
+LRCLIB_SEARCH_URL = "https://lrclib.net/api/search"
+LRCLIB_GET_URL = "https://lrclib.net/api/get"
 MAX_MUSIC_FOLDER_BYTES = 20 * 1024 * 1024 * 1024  # 20 GB
 MIN_VOLUME_PERCENT = 0.0
 MAX_VOLUME_PERCENT = 200.0
@@ -167,6 +173,99 @@ def parse_filename_metadata(
         author = None
 
     return author, clean_title or base, video_id
+
+
+_NOISE_BRACKET_RE = re.compile(
+    r"[\(\[\{]\s*(?:"
+    r"official(?:\s+music|\s+lyric|\s+hd|\s+4k|\s+audio)?(?:\s+video|\s+audio|\s+visualizer)?|"
+    r"music\s+video|lyric(?:s)?(?:\s+video)?|audio(?:\s+only)?|visualizer|"
+    r"hd|hq|4k|1080p|720p|mv|m/v|remaster(?:ed)?(?:\s+\d{4})?|"
+    r"live(?:\s+[^)\]\}]*)?|prod\.?\s+[^)\]\}]*"
+    r")\s*[\)\]\}]",
+    re.IGNORECASE,
+)
+
+
+def clean_lyrics_query(text: str) -> str:
+    """Clean a song title/query by removing file extensions, [video_id], and YouTube noise tags."""
+    if not text:
+        return ""
+    s = text.strip()
+    ext = os.path.splitext(s)[1].lower()
+    if ext in SEARCHABLE_EXTENSIONS or re.search(
+        r"\[[A-Za-z0-9_-]{6,20}\](?:\.[A-Za-z0-9]+)?$", s
+    ):
+        parsed_author, parsed_title, _ = parse_filename_metadata(s)
+        if parsed_author and parsed_title:
+            s = f"{parsed_author} {parsed_title}"
+        elif parsed_title:
+            s = parsed_title
+
+    s = _NOISE_BRACKET_RE.sub(" ", s)
+    s = re.sub(r"\b-\s*Topic\b", " ", s, flags=re.IGNORECASE)
+    s = re.sub(r"\s*[-–—|]+\s*", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or text.strip()
+
+
+def normalize_lyrics_key(text: str) -> str:
+    """Normalize a song query/name into a canonical lowercase lookup key."""
+    cleaned = clean_lyrics_query(text).lower()
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned, flags=re.UNICODE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or text.strip().lower()
+
+
+def sanitize_lyrics_filename(name: str) -> str:
+    """Convert a song/query key into a safe filesystem filename stem."""
+    safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name.strip())
+    safe = re.sub(r"\s+", " ", safe).strip(" ._")
+    if not safe:
+        safe = "lyrics"
+    return safe[:150]
+
+
+def extract_lyrics_text(record: dict) -> str | None:
+    """Extract readable lyrics from an LRCLIB track record."""
+    if not isinstance(record, dict):
+        return None
+    plain = record.get("plainLyrics")
+    if isinstance(plain, str) and plain.strip():
+        return plain.strip()
+    synced = record.get("syncedLyrics")
+    if isinstance(synced, str) and synced.strip():
+        cleaned = re.sub(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]\s*", "", synced).strip()
+        if cleaned:
+            return cleaned
+    return None
+
+
+def split_text_chunks(text: str, max_len: int = 1950) -> list[str]:
+    """Split text on line boundaries so each chunk is within Discord's 2000-char limit."""
+    if len(text) <= max_len:
+        return [text]
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+    for line in text.split("\n"):
+        while len(line) > max_len:
+            if current_lines:
+                chunks.append("\n".join(current_lines))
+                current_lines = []
+                current_len = 0
+            chunks.append(line[:max_len])
+            line = line[max_len:]
+        added_len = len(line) + (1 if current_lines else 0)
+        if current_lines and current_len + added_len > max_len:
+            chunks.append("\n".join(current_lines))
+            current_lines = [line]
+            current_len = len(line)
+        else:
+            current_lines.append(line)
+            current_len += added_len
+    if current_lines:
+        chunks.append("\n".join(current_lines))
+    return chunks or [text[:max_len]]
 
 
 def probe_audio_duration(file_path: str) -> float | None:
@@ -629,6 +728,7 @@ class MyClient(discord.Client):
         self.url_cache: dict[str, str] = {}
         self.video_id_cache: dict[str, str] = {}
         self.metadata_cache: dict[str, dict[str, object]] = {}
+        self.lyrics_cache: dict[str, dict[str, str]] = {}
         self.inflight_downloads: dict[
             str, asyncio.Future[tuple[str, float | None, str | None]]
         ] = {}
@@ -641,6 +741,7 @@ class MyClient(discord.Client):
         self.load_url_map()
         self.load_volumes()
         self.load_languages()
+        self.load_lyrics_map()
         self.enforce_storage_limit()
 
     @property
@@ -654,6 +755,14 @@ class MyClient(discord.Client):
     @property
     def lang_map_path(self) -> str:
         return os.path.join(MUSIC_FOLDER, LANG_MAP_FILENAME)
+
+    @property
+    def lyrics_map_path(self) -> str:
+        return os.path.join(MUSIC_FOLDER, LYRICS_MAP_FILENAME)
+
+    @property
+    def lyrics_folder_path(self) -> str:
+        return os.path.join(MUSIC_FOLDER, LYRICS_FOLDER_NAME)
 
     def t(self, guild_id: int, key: str, **kwargs) -> str:
         lang = self.language.get(guild_id, "en")
@@ -786,6 +895,476 @@ class MyClient(discord.Client):
                 json.dump(serializable, f, indent=2)
         except Exception:
             pass
+
+    def load_lyrics_map(self):
+        """Load persistent song/query -> lyrics file mapping from disk."""
+        path = self.lyrics_map_path
+        if not os.path.isfile(path):
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                for key, entry in data.items():
+                    if not isinstance(key, str):
+                        continue
+                    if isinstance(entry, str):
+                        full_path = (
+                            entry
+                            if os.path.isabs(entry)
+                            else os.path.join(MUSIC_FOLDER, entry)
+                        )
+                        self.lyrics_cache[key] = {
+                            "path": full_path,
+                            "title": "",
+                            "artist": "",
+                        }
+                    elif isinstance(entry, dict) and isinstance(entry.get("path"), str):
+                        raw_path = entry["path"]
+                        full_path = (
+                            raw_path
+                            if os.path.isabs(raw_path)
+                            else os.path.join(MUSIC_FOLDER, raw_path)
+                        )
+                        self.lyrics_cache[key] = {
+                            "path": full_path,
+                            "title": str(entry.get("title") or ""),
+                            "artist": str(entry.get("artist") or ""),
+                        }
+        except Exception:
+            pass
+
+    def save_lyrics_map(self):
+        """Persist song/query -> lyrics file mapping to disk."""
+        try:
+            os.makedirs(MUSIC_FOLDER, exist_ok=True)
+            with open(self.lyrics_map_path, "w", encoding="utf-8") as f:
+                json.dump(self.lyrics_cache, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def get_cached_lyrics(
+        self, keys: list[str]
+    ) -> tuple[str, str | None, str | None] | None:
+        """Fetch saved lyrics from disk if available for any of the candidate keys."""
+        for key in keys:
+            if not key:
+                continue
+            entry = self.lyrics_cache.get(key)
+            if entry:
+                path = entry.get("path")
+                if path:
+                    full_path = (
+                        path
+                        if os.path.isabs(path)
+                        else os.path.join(MUSIC_FOLDER, path)
+                    )
+                    if os.path.isfile(full_path):
+                        try:
+                            with open(full_path, "r", encoding="utf-8") as f:
+                                text = f.read().strip()
+                            if text:
+                                return (
+                                    text,
+                                    entry.get("title") or None,
+                                    entry.get("artist") or None,
+                                )
+                        except Exception:
+                            pass
+
+            candidate_file = os.path.join(
+                self.lyrics_folder_path, f"{sanitize_lyrics_filename(key)}.txt"
+            )
+            if os.path.isfile(candidate_file):
+                try:
+                    with open(candidate_file, "r", encoding="utf-8") as f:
+                        text = f.read().strip()
+                    if text:
+                        return text, None, None
+                except Exception:
+                    pass
+        return None
+
+    def save_lyrics_to_disk(
+        self,
+        keys: list[str],
+        lyrics_text: str,
+        title: str | None = None,
+        artist: str | None = None,
+    ) -> str:
+        """Save lyrics text to disk and register all lookup keys in lyrics_map.json."""
+        os.makedirs(self.lyrics_folder_path, exist_ok=True)
+        if artist and title:
+            base_label = f"{artist} - {title}"
+        elif title:
+            base_label = title
+        elif keys:
+            base_label = keys[0]
+        else:
+            base_label = "lyrics"
+
+        filename = f"{sanitize_lyrics_filename(base_label)}.txt"
+        full_path = os.path.join(self.lyrics_folder_path, filename)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(lyrics_text)
+
+        all_keys = list(keys)
+        if title:
+            all_keys.append(normalize_lyrics_key(title))
+        if artist and title:
+            all_keys.append(normalize_lyrics_key(f"{artist} {title}"))
+            all_keys.append(normalize_lyrics_key(f"{title} {artist}"))
+
+        record = {
+            "path": full_path,
+            "title": title or "",
+            "artist": artist or "",
+        }
+        for key in all_keys:
+            if key:
+                self.lyrics_cache[key] = record
+
+        self.save_lyrics_map()
+        return full_path
+
+    def _fetch_lrclib_json_sync(self, url: str) -> object | None:
+        """Perform HTTP GET to LRCLIB with retry on transient 503/429/network errors."""
+        delays = (0.0, 0.8, 1.5)
+        for idx, delay in enumerate(delays):
+            if delay > 0:
+                time.sleep(delay)
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "User-Agent": "DiscordMusicBot/1.0 (https://lrclib.net)",
+                    "Accept": "application/json",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                    return json.loads(raw)
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return None
+                if exc.code in (429, 500, 502, 503, 504) and idx < len(delays) - 1:
+                    continue
+                return None
+            except Exception:
+                if idx < len(delays) - 1:
+                    continue
+                return None
+        return None
+
+    def _pick_best_lrclib_match(
+        self,
+        records: list[dict],
+        query: str,
+        artist_hint: str | None = None,
+        title_hint: str | None = None,
+        duration_hint: float | None = None,
+    ) -> tuple[str, str | None, str | None] | None:
+        query_norm = normalize_lyrics_key(query)
+        query_tokens = [tok for tok in query_norm.split() if tok]
+        artist_norm = normalize_lyrics_key(artist_hint) if artist_hint else ""
+        title_norm = normalize_lyrics_key(title_hint) if title_hint else ""
+
+        best_score = -1
+        best_result: tuple[str, str | None, str | None] | None = None
+
+        for idx, rec in enumerate(records):
+            if not isinstance(rec, dict):
+                continue
+            lyrics = extract_lyrics_text(rec)
+            if not lyrics:
+                continue
+
+            rec_track = str(rec.get("trackName") or rec.get("name") or "").strip()
+            rec_artist = str(rec.get("artistName") or "").strip()
+            combined_norm = normalize_lyrics_key(f"{rec_artist} {rec_track}")
+            track_norm = normalize_lyrics_key(rec_track)
+            rec_artist_norm = normalize_lyrics_key(rec_artist)
+
+            score = max(0, 20 - idx)
+            if rec.get("plainLyrics"):
+                score += 5
+
+            if query_tokens:
+                matched_tokens = sum(1 for tok in query_tokens if tok in combined_norm)
+                score += matched_tokens * 10
+                if matched_tokens == len(query_tokens):
+                    score += 15
+
+            if title_norm and (title_norm in track_norm or track_norm in title_norm):
+                score += 15
+            if artist_norm and (
+                artist_norm in rec_artist_norm or rec_artist_norm in artist_norm
+            ):
+                score += 15
+
+            rec_dur = rec.get("duration")
+            if (
+                duration_hint is not None
+                and isinstance(rec_dur, (int, float))
+                and duration_hint > 0
+            ):
+                diff = abs(float(rec_dur) - float(duration_hint))
+                if diff <= 3:
+                    score += 12
+                elif diff <= 10:
+                    score += 6
+
+            if score > best_score:
+                best_score = score
+                best_result = (lyrics, rec_track or None, rec_artist or None)
+
+        return best_result
+
+    def _fetch_lyrics_from_lrclib_sync(
+        self,
+        query: str,
+        artist_hint: str | None = None,
+        title_hint: str | None = None,
+        duration_hint: float | None = None,
+    ) -> tuple[str, str | None, str | None] | None:
+        """Fetch lyrics from LRCLIB handling queries with or without '-' separator."""
+        cleaned_query = clean_lyrics_query(query)
+        cleaned_artist = clean_lyrics_query(artist_hint) if artist_hint else ""
+        cleaned_title = clean_lyrics_query(title_hint) if title_hint else ""
+
+        if (
+            not cleaned_artist
+            and not cleaned_title
+            and any(sep in query for sep in (" - ", " – ", " — "))
+        ):
+            parts = re.split(r"\s+[-–—]\s+", query.strip(), maxsplit=1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                cleaned_artist = clean_lyrics_query(parts[0])
+                cleaned_title = clean_lyrics_query(parts[1])
+
+        search_queries: list[str] = []
+        if cleaned_artist and cleaned_title:
+            if cleaned_artist.lower() not in cleaned_title.lower():
+                search_queries.append(f"{cleaned_artist} {cleaned_title}")
+            search_queries.append(cleaned_title)
+        if cleaned_query and cleaned_query not in search_queries:
+            search_queries.append(cleaned_query)
+        raw_stripped = query.strip()
+        if raw_stripped and raw_stripped not in search_queries:
+            search_queries.append(raw_stripped)
+
+        # 1. Primary full-text search on LRCLIB (?q=...) which matches across artist and track name even without '-'
+        for q in search_queries:
+            url = f"{LRCLIB_SEARCH_URL}?{urlencode({'q': q})}"
+            data = self._fetch_lrclib_json_sync(url)
+            if isinstance(data, list) and data:
+                match = self._pick_best_lrclib_match(
+                    data,
+                    query=q,
+                    artist_hint=cleaned_artist or None,
+                    title_hint=cleaned_title or None,
+                    duration_hint=duration_hint,
+                )
+                if match is not None:
+                    return match
+
+        # 2. Targeted artist_name + track_name lookup if hints are available
+        if cleaned_artist and cleaned_title:
+            get_params: dict[str, object] = {
+                "artist_name": cleaned_artist,
+                "track_name": cleaned_title,
+            }
+            if duration_hint is not None and duration_hint > 0:
+                get_params["duration"] = int(round(duration_hint))
+            get_url = f"{LRCLIB_GET_URL}?{urlencode(get_params)}"
+            get_data = self._fetch_lrclib_json_sync(get_url)
+            if isinstance(get_data, dict):
+                lyrics = extract_lyrics_text(get_data)
+                if lyrics:
+                    return (
+                        lyrics,
+                        str(
+                            get_data.get("trackName")
+                            or get_data.get("name")
+                            or cleaned_title
+                        ),
+                        str(get_data.get("artistName") or cleaned_artist),
+                    )
+
+            search_url = f"{LRCLIB_SEARCH_URL}?{urlencode({'artist_name': cleaned_artist, 'track_name': cleaned_title})}"
+            search_data = self._fetch_lrclib_json_sync(search_url)
+            if isinstance(search_data, list) and search_data:
+                match = self._pick_best_lrclib_match(
+                    search_data,
+                    query=f"{cleaned_artist} {cleaned_title}",
+                    artist_hint=cleaned_artist,
+                    title_hint=cleaned_title,
+                    duration_hint=duration_hint,
+                )
+                if match is not None:
+                    return match
+
+        # 3. Fallback for multi-word queries without '-' where full-text ?q= returned nothing:
+        # try splitting words into (artist_name, track_name) or (track_name, artist_name)
+        words = cleaned_query.split()
+        if 2 <= len(words) <= 6:
+            for split_idx in range(1, len(words)):
+                left = " ".join(words[:split_idx])
+                right = " ".join(words[split_idx:])
+                for art_cand, trk_cand in ((left, right), (right, left)):
+                    url = f"{LRCLIB_SEARCH_URL}?{urlencode({'artist_name': art_cand, 'track_name': trk_cand})}"
+                    data = self._fetch_lrclib_json_sync(url)
+                    if isinstance(data, list) and data:
+                        match = self._pick_best_lrclib_match(
+                            data,
+                            query=cleaned_query,
+                            artist_hint=art_cand,
+                            title_hint=trk_cand,
+                            duration_hint=duration_hint,
+                        )
+                        if match is not None:
+                            return match
+
+        return None
+
+    async def handle_lyrics_command(self, message, raw_query: str):
+        text_channel = message.channel
+        guild_id = text_channel.guild.id
+        query = raw_query.strip()
+
+        artist_hint: str | None = None
+        title_hint: str | None = None
+        duration_hint: float | None = None
+        candidate_keys: list[str] = []
+        display_query = query
+
+        if not query:
+            current_item = self.now_playing_item.get(guild_id)
+            voice_client = self.voice_client.get(guild_id)
+            if current_item is None:
+                if self.is_guild_active(voice_client) and self.now_playing.get(
+                    guild_id
+                ) not in (None, "None"):
+                    current_item = QueueItem(title=self.now_playing[guild_id])
+                else:
+                    await text_channel.send(self.t(guild_id, "nothing_playing"))
+                    return
+            elif voice_client is not None and not self.is_guild_active(voice_client):
+                await text_channel.send(self.t(guild_id, "nothing_playing"))
+                return
+
+            self._apply_cached_metadata(current_item)
+            title_hint = current_item.clean_title()
+            raw_author = current_item.get_author("")
+            artist_hint = raw_author if raw_author else None
+            duration_hint = current_item.duration
+            display_query = (
+                f"{artist_hint} - {title_hint}"
+                if artist_hint
+                and artist_hint.lower() not in (title_hint or "").lower()
+                else (title_hint or current_item.title)
+            )
+            query = display_query
+
+            if current_item.video_id:
+                candidate_keys.append(f"id:{current_item.video_id}")
+            if current_item.local_path:
+                candidate_keys.append(f"path:{os.path.abspath(current_item.local_path)}")
+            if artist_hint and title_hint:
+                candidate_keys.append(
+                    normalize_lyrics_key(f"{artist_hint} {title_hint}")
+                )
+            if title_hint:
+                candidate_keys.append(normalize_lyrics_key(title_hint))
+            candidate_keys.append(normalize_lyrics_key(display_query))
+        else:
+            raw_key = " ".join(query.lower().split())
+            norm_key = normalize_lyrics_key(query)
+            candidate_keys.extend([norm_key, raw_key])
+
+            matches = find_matching_files(query, MUSIC_FOLDER)
+            audio_matches = [
+                m for m in matches if not m.lower().endswith(PLAYLIST_EXTENSION)
+            ]
+            if len(audio_matches) == 1:
+                match_path = audio_matches[0]
+                parsed_author, parsed_title, parsed_vid = parse_filename_metadata(
+                    match_path
+                )
+                if parsed_vid:
+                    candidate_keys.append(f"id:{parsed_vid}")
+                candidate_keys.append(f"path:{os.path.abspath(match_path)}")
+                if parsed_author and parsed_title:
+                    artist_hint = parsed_author
+                    title_hint = parsed_title
+                    candidate_keys.append(
+                        normalize_lyrics_key(f"{parsed_author} {parsed_title}")
+                    )
+                elif parsed_title:
+                    title_hint = parsed_title
+                    candidate_keys.append(normalize_lyrics_key(parsed_title))
+
+        # Deduplicate non-empty keys while preserving order
+        dedup_keys: list[str] = []
+        for k in candidate_keys:
+            if k and k not in dedup_keys:
+                dedup_keys.append(k)
+
+        await self._delete_user_message(message)
+
+        cached = self.get_cached_lyrics(dedup_keys)
+        if cached is not None:
+            lyrics_text, cached_title, cached_artist = cached
+            final_title = cached_title or title_hint or display_query
+            final_artist = cached_artist or artist_hint
+        else:
+            fetched = await asyncio.to_thread(
+                self._fetch_lyrics_from_lrclib_sync,
+                query,
+                artist_hint,
+                title_hint,
+                duration_hint,
+            )
+            if fetched is None:
+                await text_channel.send(
+                    self.t(guild_id, "lyrics_not_found", query=display_query)
+                )
+                return
+            lyrics_text, fetched_title, fetched_artist = fetched
+            final_title = fetched_title or title_hint or display_query
+            final_artist = fetched_artist or artist_hint
+            try:
+                self.save_lyrics_to_disk(
+                    dedup_keys,
+                    lyrics_text,
+                    title=final_title,
+                    artist=final_artist,
+                )
+            except Exception:
+                pass
+
+        if (
+            final_artist
+            and final_title
+            and final_artist.lower() not in final_title.lower()
+        ):
+            full_msg = self.t(
+                guild_id,
+                "lyrics_header_with_artist",
+                artist=final_artist,
+                title=final_title,
+                lyrics=lyrics_text,
+            )
+        else:
+            full_msg = self.t(
+                guild_id,
+                "lyrics_header",
+                title=final_title or display_query,
+                lyrics=lyrics_text,
+            )
+
+        for chunk in split_text_chunks(full_msg):
+            await text_channel.send(chunk)
 
     def get_music_folder_size_bytes(self) -> int:
         if not os.path.exists(MUSIC_FOLDER):
@@ -2414,6 +2993,10 @@ class MyClient(discord.Client):
 
         if cmd == "%playnext":
             await self.handle_play_command(message, arg.strip(), play_next=True)
+            return
+
+        if cmd == "%lyrics":
+            await self.handle_lyrics_command(message, arg.strip())
             return
 
         if cmd == "%cancel":
