@@ -54,6 +54,7 @@ YDL_OPTS = {
         {
             "key": "FFmpegExtractAudio",
             "preferredcodec": "opus",
+            "preferredquality": "256",
         }
     ],
 }
@@ -3565,7 +3566,15 @@ class MyClient(discord.Client):
         )
         self.volume[guild_id] = vol
         audio = discord.PCMVolumeTransformer(raw_audio, volume=vol)
-        voice_client.play(audio, after=self.play_next_song_in_queue)
+        voice_client.play(
+            audio,
+            after=self.play_next_song_in_queue,
+            application="audio",
+            bitrate=384,
+            expected_packet_loss=0.01,
+            bandwidth="full",
+            signal_type="music",
+        )
 
         display_name = item.display_name(MUSIC_FOLDER)
         self.now_playing[guild_id] = display_name
