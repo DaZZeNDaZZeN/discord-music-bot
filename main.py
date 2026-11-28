@@ -5,12 +5,14 @@ import json
 import os
 import random
 import re
+import struct
 import subprocess
 import threading
 import time
 import urllib.error
 from urllib.parse import parse_qs, urlencode, urlparse
 import urllib.request
+import wave
 import discord
 import yt_dlp
 
@@ -62,10 +64,12 @@ YDL_OPTS = {
 
 YDL_FLAT_PLAYLIST_OPTS = {
     "extract_flat": "in_playlist",
+    "format": "bestaudio/best",
     "skip_download": True,
     "quiet": True,
     "no_warnings": True,
 }
+STREAM_URL_MAX_AGE_SECONDS = 3600.0
 
 
 def load_localization_data(
@@ -289,9 +293,91 @@ def split_text_chunks(text: str, max_len: int = 1950) -> list[str]:
     return chunks or [text[:max_len]]
 
 
+def _fast_probe_audio_duration(file_path: str) -> float | None:
+    """Parse duration directly from Ogg Opus/Vorbis, WAV, or FLAC headers without spawning ffprobe."""
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext in (".opus", ".ogg"):
+            with open(file_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                file_size = f.tell()
+                if file_size < 28:
+                    return None
+                f.seek(0)
+                head = f.read(min(4096, file_size))
+                if head[:4] != b"OggS" or head[4] != 0:
+                    return None
+                n_segs = head[26]
+                payload_offset = 27 + n_segs
+                if len(head) < payload_offset:
+                    return None
+                payload_len = sum(head[27:payload_offset])
+                if len(head) < payload_offset + payload_len:
+                    return None
+                bos_serial = struct.unpack_from("<I", head, 14)[0]
+                payload = head[payload_offset : payload_offset + payload_len]
+                if payload[:8] == b"OpusHead" and len(payload) >= 12:
+                    sample_rate = 48000
+                    pre_skip = struct.unpack_from("<H", payload, 10)[0]
+                elif payload[:7] == b"\x01vorbis" and len(payload) >= 16:
+                    sample_rate = struct.unpack_from("<I", payload, 12)[0]
+                    pre_skip = 0
+                else:
+                    return None
+                if sample_rate <= 0:
+                    return None
+
+                tail_size = min(65536, file_size)
+                f.seek(file_size - tail_size)
+                tail = f.read(tail_size)
+
+            pos = tail.rfind(b"OggS")
+            while pos != -1:
+                if pos + 27 <= len(tail) and tail[pos + 4] == 0:
+                    seg_count = tail[pos + 26]
+                    seg_end = pos + 27 + seg_count
+                    if seg_end <= len(tail):
+                        page_end = seg_end + sum(tail[pos + 27 : seg_end])
+                        if page_end == len(tail) or tail[page_end : page_end + 4] == b"OggS":
+                            serial = struct.unpack_from("<I", tail, pos + 14)[0]
+                            if serial != bos_serial:
+                                return None
+                            granule = struct.unpack_from("<q", tail, pos + 6)[0]
+                            if granule > 0:
+                                samples = max(0, granule - pre_skip)
+                                return samples / sample_rate
+                pos = tail.rfind(b"OggS", 0, pos)
+            return None
+
+        if ext == ".wav":
+            with wave.open(file_path, "rb") as wf:
+                rate = wf.getframerate()
+                frames = wf.getnframes()
+                if rate > 0 and frames >= 0:
+                    return frames / rate
+            return None
+
+        if ext == ".flac":
+            with open(file_path, "rb") as f:
+                header = f.read(42)
+            if len(header) >= 42 and header[:4] == b"fLaC" and (header[4] & 0x7F) == 0:
+                info_val = struct.unpack_from(">Q", header, 18)[0]
+                sample_rate = (info_val >> 44) & 0xFFFFF
+                total_samples = info_val & 0xFFFFFFFFF
+                if sample_rate > 0 and total_samples > 0:
+                    return total_samples / sample_rate
+            return None
+    except Exception:
+        return None
+    return None
+
+
 def probe_audio_duration(file_path: str) -> float | None:
     if not file_path or not os.path.isfile(file_path):
         return None
+    fast_dur = _fast_probe_audio_duration(file_path)
+    if fast_dur is not None and fast_dur > 0:
+        return fast_dur
     try:
         result = subprocess.run(
             [
@@ -314,6 +400,82 @@ def probe_audio_duration(file_path: str) -> float | None:
     except Exception:
         pass
     return None
+
+
+@dataclass
+class _MusicFolderIndex:
+    dir_mtimes: tuple[tuple[str, int], ...]
+    # Sorted by rel_lower: (rel_path, rel_lower, full_path, ext)
+    entries: list[tuple[str, str, str, str]]
+    opus_by_vid: dict[str, str]
+
+
+_MUSIC_FOLDER_INDEX_CACHE: dict[str, _MusicFolderIndex] = {}
+_MUSIC_FOLDER_INDEX_LOCK = threading.Lock()
+
+
+def _invalidate_music_folder_index(music_folder: str | None = None):
+    with _MUSIC_FOLDER_INDEX_LOCK:
+        if music_folder is None:
+            _MUSIC_FOLDER_INDEX_CACHE.clear()
+        else:
+            _MUSIC_FOLDER_INDEX_CACHE.pop(os.path.abspath(music_folder), None)
+
+
+def _get_music_folder_index(music_folder: str) -> _MusicFolderIndex | None:
+    if not os.path.exists(music_folder):
+        _invalidate_music_folder_index(music_folder)
+        return None
+
+    cache_key = os.path.abspath(music_folder)
+    with _MUSIC_FOLDER_INDEX_LOCK:
+        cached = _MUSIC_FOLDER_INDEX_CACHE.get(cache_key)
+
+    if cached is not None and cached.dir_mtimes:
+        valid = True
+        for dir_path, expected_mtime_ns in cached.dir_mtimes:
+            try:
+                if os.stat(dir_path).st_mtime_ns != expected_mtime_ns:
+                    valid = False
+                    break
+            except OSError:
+                valid = False
+                break
+        if valid:
+            return cached
+
+    dir_mtimes: list[tuple[str, int]] = []
+    entries: list[tuple[str, str, str, str]] = []
+    opus_by_vid: dict[str, str] = {}
+
+    for root, _, files in os.walk(music_folder):
+        try:
+            dir_mtimes.append((root, os.stat(root).st_mtime_ns))
+        except OSError:
+            pass
+        rel_dir = os.path.relpath(root, music_folder).replace("\\", "/")
+        for file in files:
+            ext = os.path.splitext(file)[1].lower()
+            if ext in SEARCHABLE_EXTENSIONS:
+                full_path = os.path.join(root, file)
+                rel_path = file if rel_dir == "." else f"{rel_dir}/{file}"
+                entries.append((rel_path, rel_path.lower(), full_path, ext))
+                if ext == ".opus" and file.endswith("].opus"):
+                    lbrack = file.rfind("[", 0, len(file) - 6)
+                    if lbrack != -1:
+                        vid = file[lbrack + 1 : -6]
+                        if vid:
+                            opus_by_vid.setdefault(vid, full_path)
+
+    entries.sort(key=lambda item: item[1])
+    built = _MusicFolderIndex(
+        dir_mtimes=tuple(dir_mtimes),
+        entries=entries,
+        opus_by_vid=opus_by_vid,
+    )
+    with _MUSIC_FOLDER_INDEX_LOCK:
+        _MUSIC_FOLDER_INDEX_CACHE[cache_key] = built
+    return built
 
 
 def find_matching_files(
@@ -348,19 +510,35 @@ def find_matching_files(
     if allowed_extensions is None:
         allowed_extensions = SEARCHABLE_EXTENSIONS
 
-    all_valid_files: list[tuple[str, str]] = []
-    for root, _, files in os.walk(music_folder):
-        for file in files:
-            ext = os.path.splitext(file)[1].lower()
-            if ext in allowed_extensions:
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, music_folder).replace("\\", "/")
-                all_valid_files.append((rel_path, full_path))
-
-    all_valid_files.sort(key=lambda item: item[0].lower())
+    all_valid_files: list[tuple[str, str, str]] = []
+    if allowed_extensions <= SEARCHABLE_EXTENSIONS:
+        idx = _get_music_folder_index(music_folder)
+        if idx is None:
+            return []
+        if allowed_extensions == SEARCHABLE_EXTENSIONS:
+            all_valid_files = [
+                (rel_path, rel_lower, full_path)
+                for rel_path, rel_lower, full_path, _ in idx.entries
+            ]
+        else:
+            all_valid_files = [
+                (rel_path, rel_lower, full_path)
+                for rel_path, rel_lower, full_path, ext in idx.entries
+                if ext in allowed_extensions
+            ]
+    else:
+        for root, _, files in os.walk(music_folder):
+            rel_dir = os.path.relpath(root, music_folder).replace("\\", "/")
+            for file in files:
+                ext = os.path.splitext(file)[1].lower()
+                if ext in allowed_extensions:
+                    full_path = os.path.join(root, file)
+                    rel_path = file if rel_dir == "." else f"{rel_dir}/{file}"
+                    all_valid_files.append((rel_path, rel_path.lower(), full_path))
+        all_valid_files.sort(key=lambda item: item[1])
 
     # 1. Exact local path match relative to music_folder
-    for rel_path, full_path in all_valid_files:
+    for rel_path, _, full_path in all_valid_files:
         if (
             rel_path in norm_candidates
             or os.path.normpath(rel_path).replace("\\", "/") in norm_candidates
@@ -371,19 +549,19 @@ def find_matching_files(
     lower_candidates = {c.lower() for c in norm_candidates}
     exact_ci = [
         full_path
-        for rel_path, full_path in all_valid_files
-        if rel_path.lower() in lower_candidates
+        for _, rel_lower, full_path in all_valid_files
+        if rel_lower in lower_candidates
     ]
     if len(exact_ci) == 1:
         return exact_ci
 
     # 2. Multi-token case-insensitive substring matching on relative path
     tokens = stripped_pattern.lower().split()
-    matches = []
-    for rel_path, full_path in all_valid_files:
-        rel_lower = rel_path.lower()
-        if all(token in rel_lower for token in tokens):
-            matches.append(full_path)
+    matches = [
+        full_path
+        for _, rel_lower, full_path in all_valid_files
+        if all(token in rel_lower for token in tokens)
+    ]
 
     return matches
 
@@ -402,10 +580,14 @@ class QueueItem:
     stream_url: str | None = field(default=None, repr=False)
     known_on_disk: InitVar[bool] = False
     download_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _parsed_local_path: str | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def __post_init__(self, known_on_disk: bool = False):
         if self.local_path:
             parsed_author, _, parsed_vid = parse_filename_metadata(self.local_path)
+            self._parsed_local_path = self.local_path
             if not self.author and parsed_author:
                 self.author = parsed_author
             if not self.video_id and parsed_vid:
@@ -759,6 +941,7 @@ class MyClient(discord.Client):
         self.video_id_cache: dict[str, str] = {}
         self.resolved_url_cache: dict[str, list[dict]] = {}
         self.metadata_cache: dict[str, dict[str, object]] = {}
+        self.duration_cache: dict[str, tuple[tuple[int, int] | None, float]] = {}
         self.lyrics_cache: dict[str, dict[str, str]] = {}
         self.inflight_downloads: dict[
             str, asyncio.Future[tuple[str, float | None, str | None]]
@@ -845,6 +1028,8 @@ class MyClient(discord.Client):
         if not url or not local_path:
             return
         norm = normalize_url(url)
+        if self.url_cache.get(norm) == local_path and os.path.isfile(self.url_map_path):
+            return
         self.url_cache[norm] = local_path
         self.save_url_map()
 
@@ -1284,7 +1469,11 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "nothing_playing"))
                 return
 
-            self._apply_cached_metadata(current_item)
+            self._apply_cached_metadata(current_item, probe_duration=False)
+            if current_item.duration is None and current_item.local_path:
+                current_item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, current_item.local_path
+                )
             title_hint = current_item.clean_title()
             raw_author = current_item.get_author("")
             artist_hint = raw_author if raw_author else None
@@ -1313,7 +1502,7 @@ class MyClient(discord.Client):
             norm_key = normalize_lyrics_key(query)
             candidate_keys.extend([norm_key, raw_key])
 
-            matches = find_matching_files(query, MUSIC_FOLDER)
+            matches = await asyncio.to_thread(find_matching_files, query, MUSIC_FOLDER)
             audio_matches = [
                 m for m in matches if not m.lower().endswith(PLAYLIST_EXTENSION)
             ]
@@ -1461,24 +1650,28 @@ class MyClient(discord.Client):
             except OSError:
                 pass
 
+        if deleted_files:
+            _invalidate_music_folder_index(MUSIC_FOLDER)
         return deleted_files
 
     async def on_ready(self):
         print(f"Logged on as {self.user}!")
 
     async def get_user_voice_channel(self, message):
-        voice_channel = None
-        try:
-            if hasattr(message.author, "fetch_voice"):
+        voice_state = getattr(message.author, "voice", None)
+        if (
+            voice_state is not None
+            and getattr(voice_state, "channel", None) is not None
+        ):
+            return voice_state.channel
+        if hasattr(message.author, "fetch_voice"):
+            try:
                 voice_state = await message.author.fetch_voice()
                 if voice_state is not None:
-                    voice_channel = voice_state.channel
-            elif getattr(message.author, "voice", None) is not None:
-                voice_channel = message.author.voice.channel
-        except (discord.NotFound, discord.HTTPException, AttributeError):
-            if getattr(message.author, "voice", None) is not None:
-                voice_channel = message.author.voice.channel
-        return voice_channel
+                    return voice_state.channel
+            except (discord.NotFound, discord.HTTPException, AttributeError):
+                pass
+        return None
 
     def find_existing_opus_by_id(self, video_id: str | None) -> str | None:
         if not video_id:
@@ -1486,15 +1679,13 @@ class MyClient(discord.Client):
         cached = self.video_id_cache.get(video_id)
         if cached and os.path.isfile(cached):
             return cached
-        if not os.path.exists(MUSIC_FOLDER):
+        idx = _get_music_folder_index(MUSIC_FOLDER)
+        if idx is None:
             return None
-        suffix = f"[{video_id}].opus"
-        for root, _, files in os.walk(MUSIC_FOLDER):
-            for file in files:
-                if file.endswith(suffix):
-                    full_path = os.path.join(root, file)
-                    self.video_id_cache[video_id] = full_path
-                    return full_path
+        found = idx.opus_by_vid.get(video_id)
+        if found and os.path.isfile(found):
+            self.video_id_cache[video_id] = found
+            return found
         return None
 
     def get_cached_download(
@@ -1554,7 +1745,50 @@ class MyClient(discord.Client):
             self.metadata_cache[f"id:{video_id}"] = meta
         return meta
 
-    def _apply_cached_metadata(self, item: QueueItem):
+    def _get_cached_duration(self, file_path: str | None) -> float | None:
+        if not file_path:
+            return None
+        duration_cache = getattr(self, "duration_cache", None)
+        if not duration_cache or file_path not in duration_cache:
+            return None
+        stat_sig, cached_dur = duration_cache[file_path]
+        if stat_sig is None:
+            return cached_dur
+        try:
+            st = os.stat(file_path)
+            if (st.st_mtime_ns, st.st_size) == stat_sig:
+                return cached_dur
+        except OSError:
+            return None
+        duration_cache.pop(file_path, None)
+        return None
+
+    def _probe_and_cache_duration(self, file_path: str | None) -> float | None:
+        if not file_path:
+            return None
+        cached_dur = self._get_cached_duration(file_path)
+        if cached_dur is not None:
+            return cached_dur
+        if not os.path.isfile(file_path):
+            return None
+        dur = probe_audio_duration(file_path)
+        if dur is not None:
+            duration_cache = getattr(self, "duration_cache", None)
+            if duration_cache is None:
+                duration_cache = {}
+                self.duration_cache = duration_cache
+            try:
+                st = os.stat(file_path)
+                stat_sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
+            except OSError:
+                stat_sig = None
+            duration_cache[file_path] = (stat_sig, dur)
+            meta_cache = getattr(self, "metadata_cache", None)
+            if isinstance(meta_cache, dict) and file_path in meta_cache:
+                meta_cache[file_path]["duration"] = dur
+        return dur
+
+    def _apply_cached_metadata(self, item: QueueItem, *, probe_duration: bool = True):
         meta = None
         if item.local_path and item.local_path in self.metadata_cache:
             meta = self.metadata_cache[item.local_path]
@@ -1572,13 +1806,21 @@ class MyClient(discord.Client):
                 item.video_id = str(meta["video_id"])
 
         if item.local_path:
-            parsed_author, _, parsed_vid = parse_filename_metadata(item.local_path)
-            if not item.author and parsed_author:
-                item.author = parsed_author
-            if not item.video_id and parsed_vid:
-                item.video_id = parsed_vid
-            if item.duration is None and os.path.isfile(item.local_path):
-                item.duration = probe_audio_duration(item.local_path)
+            if (
+                not item.author or not item.video_id
+            ) and getattr(item, "_parsed_local_path", None) != item.local_path:
+                parsed_author, _, parsed_vid = parse_filename_metadata(item.local_path)
+                item._parsed_local_path = item.local_path
+                if not item.author and parsed_author:
+                    item.author = parsed_author
+                if not item.video_id and parsed_vid:
+                    item.video_id = parsed_vid
+            if item.duration is None:
+                cached_dur = self._get_cached_duration(item.local_path)
+                if cached_dur is not None:
+                    item.duration = cached_dur
+                elif probe_duration and os.path.isfile(item.local_path):
+                    item.duration = self._probe_and_cache_duration(item.local_path)
         if not item.thumbnail and item.video_id:
             item.thumbnail = f"https://i.ytimg.com/vi/{item.video_id}/hqdefault.jpg"
 
@@ -1594,15 +1836,14 @@ class MyClient(discord.Client):
                 _, parsed_title, parsed_vid = parse_filename_metadata(cached)
                 return (
                     cached,
-                    probe_audio_duration(cached),
+                    self._probe_and_cache_duration(cached),
                     parsed_title or os.path.basename(cached),
                     parsed_vid,
                 )
 
-        # First extract info without downloading to check if video_id is already on disk
-        probe_opts = dict(YDL_OPTS)
-        probe_opts["skip_download"] = True
-        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+        # Extract info first without downloading to check if video_id is already on disk,
+        # then download + convert using the same YoutubeDL instance if needed.
+        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(query_or_url, download=False)
             if "entries" in info:
                 entries = [e for e in info["entries"] if e]
@@ -1638,8 +1879,6 @@ class MyClient(discord.Client):
                     self.update_url_mapping(info["webpage_url"], opus_path)
                 return opus_path, duration, title, video_id
 
-        # Actually download and convert to .opus using the already-extracted info
-        with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.process_ie_result(info, download=True)
             if "entries" in info:
                 entries = [e for e in info["entries"] if e]
@@ -1657,6 +1896,7 @@ class MyClient(discord.Client):
                 self.update_url_mapping(query_or_url, opus_path)
             if info.get("webpage_url"):
                 self.update_url_mapping(info["webpage_url"], opus_path)
+            _invalidate_music_folder_index(MUSIC_FOLDER)
             self.enforce_storage_limit()
             return opus_path, duration, title, video_id
 
@@ -1664,7 +1904,11 @@ class MyClient(discord.Client):
         if item.local_path and os.path.isfile(item.local_path):
             if item.url:
                 self.update_url_mapping(item.url, item.local_path)
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, item.local_path
+                )
             item.download_event.set()
             return item.local_path
 
@@ -1672,7 +1916,11 @@ class MyClient(discord.Client):
         cached = self.get_cached_download(item.url, item.video_id)
         if cached:
             item.local_path = cached
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, cached
+                )
             item.download_event.set()
             return cached
 
@@ -1694,7 +1942,11 @@ class MyClient(discord.Client):
                 not item.title or item.title == item.url or item.title == target
             ):
                 item.title = title
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None and opus_path:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, opus_path
+                )
             item.download_event.set()
             return opus_path
 
@@ -1717,7 +1969,11 @@ class MyClient(discord.Client):
                 not item.title or item.title == item.url or item.title == target
             ):
                 item.title = title
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None and opus_path:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, opus_path
+                )
             item.download_event.set()
             fut.set_result((opus_path, duration, title))
             return opus_path
@@ -1778,15 +2034,27 @@ class MyClient(discord.Client):
 
     async def prepare_first_item_for_stream(self, item: QueueItem):
         if item.local_path and os.path.isfile(item.local_path):
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, item.local_path
+                )
             item.download_event.set()
             return
 
         cached = self.get_cached_download(item.url, item.video_id)
         if cached:
             item.local_path = cached
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, cached
+                )
             item.download_event.set()
+            return
+
+        if item.stream_url:
+            self._apply_cached_metadata(item, probe_duration=False)
             return
 
         target = item.url or item.title
@@ -1810,13 +2078,17 @@ class MyClient(discord.Client):
 
         if local_path:
             item.local_path = local_path
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
+            if item.duration is None:
+                item.duration = await asyncio.to_thread(
+                    self._probe_and_cache_duration, local_path
+                )
             item.download_event.set()
             return
 
         if stream_url:
             item.stream_url = stream_url
-            self._apply_cached_metadata(item)
+            self._apply_cached_metadata(item, probe_duration=False)
         else:
             # Fallback to full download if no direct stream URL was returned
             await self.ensure_item_downloaded(item)
@@ -1861,7 +2133,7 @@ class MyClient(discord.Client):
                     cached = self.get_cached_download(item.url, item.video_id)
                     if cached:
                         item.local_path = cached
-                        self._apply_cached_metadata(item)
+                        self._apply_cached_metadata(item, probe_duration=False)
                         item.download_event.set()
                     elif not item.local_path or not os.path.isfile(item.local_path):
                         next_to_download = item
@@ -1932,6 +2204,9 @@ class MyClient(discord.Client):
                 vid_id = info.get("id")
                 webpage_url = info.get("webpage_url") or norm_url
                 meta = self._extract_info_metadata(info)
+                stream_url = info.get("url")
+                if not stream_url and info.get("requested_formats"):
+                    stream_url = info["requested_formats"][0].get("url")
                 return [
                     {
                         "url": normalize_url(webpage_url),
@@ -1940,6 +2215,8 @@ class MyClient(discord.Client):
                         "duration": info.get("duration"),
                         "author": meta.get("author"),
                         "thumbnail": meta.get("thumbnail"),
+                        "stream_url": stream_url,
+                        "stream_fetched_at": time.monotonic() if stream_url else None,
                     }
                 ]
 
@@ -2235,7 +2512,7 @@ class MyClient(discord.Client):
         self._apply_cached_metadata(current_item)
         duration = current_item.duration
         if duration is None and current_item.local_path:
-            duration = probe_audio_duration(current_item.local_path)
+            duration = self._probe_and_cache_duration(current_item.local_path)
             current_item.duration = duration
             if guild_id in self.playback_state:
                 self.playback_state[guild_id]["duration"] = duration
@@ -2296,40 +2573,52 @@ class MyClient(discord.Client):
             except Exception:
                 pass
 
-    async def _delete_player_message(self, guild_id: int):
-        old_msg = self.player_messages.pop(guild_id, None)
-        if old_msg is not None and hasattr(old_msg, "delete"):
+    async def _delete_msg_quietly(self, msg):
+        if msg is not None and hasattr(msg, "delete"):
             try:
-                await old_msg.delete()
+                await msg.delete()
             except Exception:
                 pass
 
+    async def _delete_player_message(self, guild_id: int):
+        old_msg = self.player_messages.pop(guild_id, None)
+        await self._delete_msg_quietly(old_msg)
+
     async def recreate_player_message(self, guild_id: int, extra_added_count: int = 0):
         """Delete previous interactive player message and create a new one at the bottom of the channel."""
-        await self._delete_player_message(guild_id)
-        current_item = self.now_playing_item.get(guild_id)
-        voice_client = self.voice_client.get(guild_id)
-        text_channel = self.last_text_channel.get(guild_id)
-        if (
-            current_item is None
-            or text_channel is None
-            or not self.is_guild_active(voice_client)
-        ):
-            return None
+        old_msg = self.player_messages.pop(guild_id, None)
+        delete_old_task = (
+            asyncio.create_task(self._delete_msg_quietly(old_msg))
+            if old_msg is not None and hasattr(old_msg, "delete")
+            else None
+        )
+        try:
+            current_item = self.now_playing_item.get(guild_id)
+            voice_client = self.voice_client.get(guild_id)
+            text_channel = self.last_text_channel.get(guild_id)
+            if (
+                current_item is None
+                or text_channel is None
+                or not self.is_guild_active(voice_client)
+            ):
+                return None
 
-        fallback_text, embed = self.build_player_display(
-            guild_id, current_item, extra_added_count=extra_added_count
-        )
-        player_view = self.create_player_view(guild_id)
-        sent = await self._safe_send(
-            text_channel,
-            None,
-            embed=embed,
-            view=player_view,
-            fallback_text=fallback_text,
-        )
-        self.player_messages[guild_id] = sent
-        return sent
+            fallback_text, embed = self.build_player_display(
+                guild_id, current_item, extra_added_count=extra_added_count
+            )
+            player_view = self.create_player_view(guild_id)
+            sent = await self._safe_send(
+                text_channel,
+                None,
+                embed=embed,
+                view=player_view,
+                fallback_text=fallback_text,
+            )
+            self.player_messages[guild_id] = sent
+            return sent
+        finally:
+            if delete_old_task is not None:
+                await delete_old_task
 
     async def _safe_send(
         self,
@@ -2415,10 +2704,17 @@ class MyClient(discord.Client):
                 pass
 
     def _local_match_to_items(
-        self, match_path: str, requester_name: str
+        self,
+        match_path: str,
+        requester_name: str,
+        *,
+        probe_duration: bool = True,
     ) -> list[QueueItem]:
         if match_path.lower().endswith(PLAYLIST_EXTENSION):
-            return self.load_playlist_file(match_path, added_by=requester_name)
+            items = self.load_playlist_file(match_path, added_by=requester_name)
+            if probe_duration and items:
+                self._apply_cached_metadata(items[0], probe_duration=True)
+            return items
         rel_name = (
             match_path[len(MUSIC_FOLDER) :]
             if match_path.startswith(MUSIC_FOLDER)
@@ -2430,7 +2726,7 @@ class MyClient(discord.Client):
             added_by=requester_name,
             known_on_disk=True,
         )
-        self._apply_cached_metadata(item)
+        self._apply_cached_metadata(item, probe_duration=probe_duration)
         return [item]
 
     def _resolve_local_mode_sync(
@@ -2445,11 +2741,29 @@ class MyClient(discord.Client):
         if mode == "batch":
             items: list[QueueItem] = []
             for match_path in matches:
-                items.extend(self._local_match_to_items(match_path, requester_name))
+                items.extend(
+                    self._local_match_to_items(
+                        match_path, requester_name, probe_duration=False
+                    )
+                )
+            if items:
+                self._apply_cached_metadata(items[0], probe_duration=True)
             return matches, items
         if mode == "local" and len(matches) > 1:
             return matches, []
-        return matches, self._local_match_to_items(matches[0], requester_name)
+        return matches, self._local_match_to_items(
+            matches[0], requester_name, probe_duration=True
+        )
+
+    def _resolve_default_local_sync(
+        self, query: str, requester_name: str
+    ) -> list[QueueItem] | None:
+        matches = find_matching_files(query, MUSIC_FOLDER)
+        if len(matches) == 1:
+            return self._local_match_to_items(
+                matches[0], requester_name, probe_duration=True
+            )
+        return None
 
     async def handle_play_command(
         self,
@@ -2473,266 +2787,344 @@ class MyClient(discord.Client):
             await text_channel.send(self.t(guild_id, "join_voice"))
             return
 
-        await self._delete_user_message(message)
-
-        requester_name = (
-            getattr(message.author, "display_name", None)
-            or getattr(message.author, "name", None)
-            or str(message.author)
-        )
-
-        voice_client = self.voice_client.get(guild_id)
-        items_to_add: list[QueueItem] = []
-        status_msg = None
-
+        delete_task = asyncio.create_task(self._delete_user_message(message))
         try:
-            if mode in ("batch", "local", "first"):
-                matches, resolved_items = await asyncio.to_thread(
-                    self._resolve_local_mode_sync, query, requester_name, mode
-                )
-                if mode == "local" and len(matches) > 1:
-                    shown = matches[:5]
-                    lines = [
-                        f"{idx}. ```{os.path.relpath(p, MUSIC_FOLDER).replace(chr(92), '/')}```"
-                        for idx, p in enumerate(shown, start=1)
-                    ]
-                    output = self.t(
-                        guild_id,
-                        "lplay_multiple",
-                        total=len(matches),
-                        shown=len(shown),
-                    ) + "\n\n".join(lines)
-                    await text_channel.send(output)
-                    return
-                if not resolved_items:
-                    await text_channel.send(
-                        self.t(guild_id, "find_none", pattern=query)
+            requester_name = (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", None)
+                or str(message.author)
+            )
+
+            voice_client = self.voice_client.get(guild_id)
+            items_to_add: list[QueueItem] = []
+            status_msg = None
+
+            try:
+                if mode in ("batch", "local", "first"):
+                    matches, resolved_items = await asyncio.to_thread(
+                        self._resolve_local_mode_sync, query, requester_name, mode
                     )
-                    return
-                items_to_add.extend(resolved_items)
-            elif is_url(query):
-                norm_url = normalize_url(query)
-                vid_id = extract_youtube_video_id(norm_url)
-                cached = self.get_cached_download(norm_url, vid_id)
-                if cached:
-                    if norm_url not in self.url_cache:
-                        self.update_url_mapping(norm_url, cached)
-                    rel_name = os.path.relpath(cached, MUSIC_FOLDER).replace("\\", "/")
-                    item = QueueItem(
-                        title=rel_name,
-                        local_path=cached,
-                        url=norm_url,
-                        video_id=vid_id,
-                        added_by=requester_name,
-                    )
-                    self._apply_cached_metadata(item)
-                    items_to_add.append(item)
-                else:
-                    entries = self.resolved_url_cache.get(norm_url) or (
-                        self.resolved_url_cache.get(f"id:{vid_id}") if vid_id else None
-                    )
-                    if entries is None:
-                        search_text = self.t(guild_id, "searching", query=query)
-                        status_msg = await self._safe_send(
-                            text_channel,
-                            None,
-                            embed=self.build_searching_embed(guild_id, query),
-                            fallback_text=search_text,
+                    if mode == "local" and len(matches) > 1:
+                        shown = matches[:5]
+                        lines = [
+                            f"{idx}. ```{os.path.relpath(p, MUSIC_FOLDER).replace(chr(92), '/')}```"
+                            for idx, p in enumerate(shown, start=1)
+                        ]
+                        output = self.t(
+                            guild_id,
+                            "lplay_multiple",
+                            total=len(matches),
+                            shown=len(shown),
+                        ) + "\n\n".join(lines)
+                        await text_channel.send(output)
+                        return
+                    if not resolved_items:
+                        await text_channel.send(
+                            self.t(guild_id, "find_none", pattern=query)
                         )
-                        entries = await asyncio.to_thread(
-                            self._extract_url_entries_sync, norm_url
+                        return
+                    items_to_add.extend(resolved_items)
+                elif is_url(query):
+                    norm_url = normalize_url(query)
+                    vid_id = extract_youtube_video_id(norm_url)
+                    cached = self.get_cached_download(norm_url, vid_id)
+                    if cached:
+                        if norm_url not in self.url_cache:
+                            self.update_url_mapping(norm_url, cached)
+                        rel_name = os.path.relpath(cached, MUSIC_FOLDER).replace(
+                            "\\", "/"
                         )
-                        if entries:
-                            self.resolved_url_cache[norm_url] = entries
-                            if len(entries) == 1:
-                                first_entry = entries[0]
-                                if first_entry.get("id"):
-                                    self.resolved_url_cache[
-                                        f"id:{first_entry['id']}"
-                                    ] = entries
-                                if first_entry.get("url"):
-                                    self.resolved_url_cache[
-                                        normalize_url(first_entry["url"])
-                                    ] = entries
-                    if len(entries) > 1:
-                        # Playlist URL: add all individual song URLs to queue
-                        for entry in entries:
-                            entry_url = entry["url"]
-                            vid_id = entry.get("id")
-                            existing = self.get_cached_download(entry_url, vid_id)
-                            q_item = QueueItem(
-                                title=entry.get("title") or entry_url,
+                        item = QueueItem(
+                            title=rel_name,
+                            local_path=cached,
+                            url=norm_url,
+                            video_id=vid_id,
+                            added_by=requester_name,
+                        )
+                        self._apply_cached_metadata(item, probe_duration=False)
+                        if item.duration is None:
+                            item.duration = await asyncio.to_thread(
+                                self._probe_and_cache_duration, cached
+                            )
+                        items_to_add.append(item)
+                    else:
+                        entries = self.resolved_url_cache.get(norm_url) or (
+                            self.resolved_url_cache.get(f"id:{vid_id}")
+                            if vid_id
+                            else None
+                        )
+                        if entries is None:
+                            search_text = self.t(guild_id, "searching", query=query)
+                            status_msg = await self._safe_send(
+                                text_channel,
+                                None,
+                                embed=self.build_searching_embed(guild_id, query),
+                                fallback_text=search_text,
+                            )
+                            entries = await asyncio.to_thread(
+                                self._extract_url_entries_sync, norm_url
+                            )
+                            if entries:
+                                self.resolved_url_cache[norm_url] = entries
+                                if len(entries) == 1:
+                                    first_entry = entries[0]
+                                    if first_entry.get("id"):
+                                        self.resolved_url_cache[
+                                            f"id:{first_entry['id']}"
+                                        ] = entries
+                                    if first_entry.get("url"):
+                                        self.resolved_url_cache[
+                                            normalize_url(first_entry["url"])
+                                        ] = entries
+                        if len(entries) > 1:
+                            # Playlist URL: add all individual song URLs to queue
+                            for entry in entries:
+                                entry_url = entry["url"]
+                                vid_id = entry.get("id")
+                                existing = self.get_cached_download(entry_url, vid_id)
+                                q_item = QueueItem(
+                                    title=entry.get("title") or entry_url,
+                                    local_path=existing,
+                                    url=entry_url,
+                                    video_id=vid_id,
+                                    duration=entry.get("duration"),
+                                    author=entry.get("author"),
+                                    added_by=requester_name,
+                                    thumbnail=entry.get("thumbnail"),
+                                )
+                                self._apply_cached_metadata(
+                                    q_item, probe_duration=False
+                                )
+                                items_to_add.append(q_item)
+                            if (
+                                items_to_add
+                                and items_to_add[0].duration is None
+                                and items_to_add[0].local_path
+                            ):
+                                items_to_add[0].duration = await asyncio.to_thread(
+                                    self._probe_and_cache_duration,
+                                    items_to_add[0].local_path,
+                                )
+                        else:
+                            # Single song URL: reuse cached file if present, otherwise stream/download asynchronously
+                            entry = (
+                                entries[0]
+                                if entries
+                                else {
+                                    "url": norm_url,
+                                    "id": vid_id,
+                                    "title": norm_url,
+                                    "duration": None,
+                                    "author": None,
+                                    "thumbnail": None,
+                                }
+                            )
+                            entry_url = entry.get("url") or norm_url
+                            entry_vid_id = entry.get("id") or vid_id
+                            existing = self.get_cached_download(
+                                entry_url, entry_vid_id
+                            )
+                            fresh_stream_url = None
+                            if (
+                                not existing
+                                and entry.get("stream_url")
+                                and entry.get("stream_fetched_at") is not None
+                                and (
+                                    time.monotonic() - float(entry["stream_fetched_at"])
+                                    < STREAM_URL_MAX_AGE_SECONDS
+                                )
+                            ):
+                                fresh_stream_url = entry["stream_url"]
+                            item = QueueItem(
+                                title=entry.get("title") or norm_url,
                                 local_path=existing,
                                 url=entry_url,
-                                video_id=vid_id,
+                                video_id=entry_vid_id,
                                 duration=entry.get("duration"),
                                 author=entry.get("author"),
                                 added_by=requester_name,
                                 thumbnail=entry.get("thumbnail"),
+                                stream_url=fresh_stream_url,
                             )
-                            self._apply_cached_metadata(q_item)
-                            items_to_add.append(q_item)
-                    else:
-                        # Single song URL: reuse cached file if present, otherwise stream/download asynchronously
-                        entry = (
-                            entries[0]
-                            if entries
-                            else {
-                                "url": norm_url,
-                                "id": vid_id,
-                                "title": norm_url,
-                                "duration": None,
-                                "author": None,
-                                "thumbnail": None,
-                            }
-                        )
-                        entry_url = entry.get("url") or norm_url
-                        entry_vid_id = entry.get("id") or vid_id
-                        existing = self.get_cached_download(entry_url, entry_vid_id)
-                        item = QueueItem(
-                            title=entry.get("title") or norm_url,
-                            local_path=existing,
-                            url=entry_url,
-                            video_id=entry_vid_id,
-                            duration=entry.get("duration"),
-                            author=entry.get("author"),
-                            added_by=requester_name,
-                            thumbnail=entry.get("thumbnail"),
-                        )
-                        self._apply_cached_metadata(item)
-                        items_to_add.append(item)
-            else:
-                # Search local music directory using %find matching rules
-                matches = find_matching_files(query, MUSIC_FOLDER)
-                if len(matches) == 1:
-                    items_to_add.extend(
-                        self._local_match_to_items(matches[0], requester_name)
-                    )
+                            self._apply_cached_metadata(item, probe_duration=False)
+                            if item.duration is None and item.local_path:
+                                item.duration = await asyncio.to_thread(
+                                    self._probe_and_cache_duration, item.local_path
+                                )
+                            items_to_add.append(item)
                 else:
-                    # 0 or multiple local matches: search on YouTube and download as .opus
-                    search_text = self.t(guild_id, "searching", query=query)
-                    status_msg = await self._safe_send(
-                        text_channel,
-                        None,
-                        embed=self.build_searching_embed(guild_id, query),
-                        fallback_text=search_text,
+                    # Search local music directory using %find matching rules
+                    local_items = await asyncio.to_thread(
+                        self._resolve_default_local_sync, query, requester_name
                     )
-                    item = QueueItem(title=query, added_by=requester_name)
-                    await self.ensure_item_downloaded(item)
-                    items_to_add.append(item)
-        except Exception as exc:
-            err_text = self.t(guild_id, "play_error", query=query, err=exc)
-            err_embed = self.build_error_embed(guild_id, query, exc)
-            await self._send_or_edit(
-                text_channel,
-                status_msg,
-                None,
-                embed=err_embed,
-                fallback_text=err_text,
+                    if local_items is not None:
+                        items_to_add.extend(local_items)
+                    else:
+                        # 0 or multiple local matches: stream-first YouTube search
+                        item = QueueItem(title=query, added_by=requester_name)
+                        if self.is_guild_active(voice_client):
+                            search_text = self.t(guild_id, "searching", query=query)
+                            status_msg = await self._safe_send(
+                                text_channel,
+                                None,
+                                embed=self.build_searching_embed(guild_id, query),
+                                fallback_text=search_text,
+                            )
+                            await self.prepare_first_item_for_stream(item)
+                        items_to_add.append(item)
+            except Exception as exc:
+                err_text = self.t(guild_id, "play_error", query=query, err=exc)
+                err_embed = self.build_error_embed(guild_id, query, exc)
+                await self._send_or_edit(
+                    text_channel,
+                    status_msg,
+                    None,
+                    embed=err_embed,
+                    fallback_text=err_text,
+                )
+                return
+
+            if not items_to_add:
+                await self._send_or_edit(
+                    text_channel, status_msg, self.t(guild_id, "no_playable")
+                )
+                return
+
+            batch_id = self._next_batch_id
+            self._next_batch_id += 1
+            for item in items_to_add:
+                if not item.added_by:
+                    item.added_by = requester_name
+                item.batch_id = batch_id
+            self.play_batches[guild_id].append(batch_id)
+
+            was_queue_empty_and_inactive = (
+                not self.is_guild_active(voice_client)
+                and len(self.queue[guild_id]) == 0
             )
-            return
+            self.enqueue_items(guild_id, items_to_add, play_next=play_next)
 
-        if not items_to_add:
-            await self._send_or_edit(
-                text_channel, status_msg, self.t(guild_id, "no_playable")
-            )
-            return
-
-        batch_id = self._next_batch_id
-        self._next_batch_id += 1
-        for item in items_to_add:
-            if not item.added_by:
-                item.added_by = requester_name
-            item.batch_id = batch_id
-        self.play_batches[guild_id].append(batch_id)
-
-        was_queue_empty_and_inactive = (
-            not self.is_guild_active(voice_client) and len(self.queue[guild_id]) == 0
-        )
-        self.enqueue_items(guild_id, items_to_add, play_next=play_next)
-
-        if not self.is_guild_active(voice_client):
-            # Start first song as fast as possible, then download remaining 5 leftmost URLs in background
-            first_item = self.queue[guild_id].popleft()
-            self.trigger_background_downloads(guild_id)
-            is_connected_fn = getattr(voice_client, "is_connected", None)
-            voice_task = None
-            if voice_client is None or (
-                callable(is_connected_fn) and not is_connected_fn()
-            ):
-                voice_task = asyncio.create_task(self.get_voice_client(voice_channel))
-
-            if not first_item.local_path or not os.path.isfile(first_item.local_path):
-                if status_msg is None:
-                    search_text = self.t(guild_id, "searching", query=first_item.title)
-                    status_msg = await self._safe_send(
-                        text_channel,
-                        None,
-                        embed=self.build_searching_embed(guild_id, first_item.title),
-                        fallback_text=search_text,
+            if not self.is_guild_active(voice_client):
+                # Start first song as fast as possible, then download remaining 5 leftmost URLs in background
+                first_item = self.queue[guild_id].popleft()
+                self.trigger_background_downloads(guild_id)
+                is_connected_fn = getattr(voice_client, "is_connected", None)
+                voice_task = None
+                if voice_client is None or (
+                    callable(is_connected_fn) and not is_connected_fn()
+                ):
+                    voice_task = asyncio.create_task(
+                        self.get_voice_client(voice_channel)
                     )
-                try:
-                    await self.prepare_first_item_for_stream(first_item)
-                except Exception as exc:
-                    if voice_task is not None and not voice_task.done():
-                        voice_task.cancel()
-                    err_text = self.t(
-                        guild_id, "play_error", query=first_item.title, err=exc
+
+                if not first_item.local_path or not os.path.isfile(
+                    first_item.local_path
+                ):
+                    if status_msg is None:
+                        search_text = self.t(
+                            guild_id, "searching", query=first_item.title
+                        )
+                        status_msg = await self._safe_send(
+                            text_channel,
+                            None,
+                            embed=self.build_searching_embed(
+                                guild_id, first_item.title
+                            ),
+                            fallback_text=search_text,
+                        )
+                    try:
+                        await self.prepare_first_item_for_stream(first_item)
+                    except Exception as exc:
+                        if self.play_batches[guild_id][-1:] == [batch_id]:
+                            self.play_batches[guild_id].pop()
+                        if voice_task is not None and not voice_task.done():
+                            voice_task.cancel()
+                        err_text = self.t(
+                            guild_id, "play_error", query=first_item.title, err=exc
+                        )
+                        err_embed = self.build_error_embed(
+                            guild_id, first_item.title, exc
+                        )
+                        await self._send_or_edit(
+                            text_channel,
+                            status_msg,
+                            None,
+                            embed=err_embed,
+                            fallback_text=err_text,
+                        )
+                        return
+
+                    if (
+                        not first_item.local_path
+                        or not os.path.isfile(first_item.local_path)
+                    ) and first_item.stream_url:
+                        asyncio.create_task(self._background_download_item(first_item))
+                elif first_item.duration is None:
+                    first_item.duration = await asyncio.to_thread(
+                        self._probe_and_cache_duration, first_item.local_path
                     )
-                    err_embed = self.build_error_embed(guild_id, first_item.title, exc)
+
+                card_text, card_embed = self.build_added_to_queue_display(
+                    guild_id,
+                    first_item,
+                    total_added=len(items_to_add),
+                    play_next=play_next,
+                )
+                if voice_task is None:
+                    self.play(voice_client, first_item)
                     await self._send_or_edit(
                         text_channel,
                         status_msg,
                         None,
-                        embed=err_embed,
-                        fallback_text=err_text,
+                        embed=card_embed,
+                        view=None,
+                        fallback_text=card_text,
                     )
-                    return
+                else:
+                    send_card_task = asyncio.create_task(
+                        self._send_or_edit(
+                            text_channel,
+                            status_msg,
+                            None,
+                            embed=card_embed,
+                            view=None,
+                            fallback_text=card_text,
+                        )
+                    )
+                    try:
+                        voice_client = await voice_task
+                    except Exception:
+                        await send_card_task
+                        raise
+                    self.play(voice_client, first_item)
+                    await send_card_task
 
-                if (
-                    not first_item.local_path or not os.path.isfile(first_item.local_path)
-                ) and first_item.stream_url:
-                    asyncio.create_task(self._background_download_item(first_item))
-
-            # Always send/edit the song info card first
-            card_text, card_embed = self.build_added_to_queue_display(
-                guild_id,
-                first_item,
-                total_added=len(items_to_add),
-                play_next=play_next,
-            )
-            await self._send_or_edit(
-                text_channel,
-                status_msg,
-                None,
-                embed=card_embed,
-                view=None,
-                fallback_text=card_text,
-            )
-
-            if voice_task is not None:
-                voice_client = await voice_task
-            self.play(voice_client, first_item)
-            if was_queue_empty_and_inactive:
-                await self.recreate_player_message(guild_id)
-        else:
-            # Song was added to queue while already playing: send song info card without creating player
-            self.trigger_background_downloads(guild_id)
-            primary_item = items_to_add[0]
-            fallback_text, embed = self.build_added_to_queue_display(
-                guild_id,
-                primary_item,
-                total_added=len(items_to_add),
-                play_next=play_next,
-            )
-            await self._send_or_edit(
-                text_channel,
-                status_msg,
-                None,
-                embed=embed,
-                view=None,
-                fallback_text=fallback_text,
-            )
+                if was_queue_empty_and_inactive:
+                    await self.recreate_player_message(guild_id)
+            else:
+                # Song was added to queue while already playing: send song info card without creating player
+                self.trigger_background_downloads(guild_id)
+                primary_item = items_to_add[0]
+                if primary_item.duration is None and primary_item.local_path:
+                    primary_item.duration = await asyncio.to_thread(
+                        self._probe_and_cache_duration, primary_item.local_path
+                    )
+                fallback_text, embed = self.build_added_to_queue_display(
+                    guild_id,
+                    primary_item,
+                    total_added=len(items_to_add),
+                    play_next=play_next,
+                )
+                await self._send_or_edit(
+                    text_channel,
+                    status_msg,
+                    None,
+                    embed=embed,
+                    view=None,
+                    fallback_text=fallback_text,
+                )
+        finally:
+            await delete_task
 
     def _record_item_in_history(self, guild_id: int, item: QueueItem | None):
         if item is None:
@@ -2966,7 +3358,9 @@ class MyClient(discord.Client):
             return self.t(guild_id, "nothing_playing")
 
         if current_item.duration is None and current_item.local_path:
-            current_item.duration = probe_audio_duration(current_item.local_path)
+            current_item.duration = await asyncio.to_thread(
+                self._probe_and_cache_duration, current_item.local_path
+            )
 
         elapsed = self.get_current_playback_seconds(guild_id)
         new_pos = max(0.0, elapsed + delta_seconds)
@@ -3793,7 +4187,7 @@ class MyClient(discord.Client):
         self._apply_cached_metadata(item)
         is_remote_stream = bool(path and is_url(path))
         if item.duration is None and path and not is_remote_stream:
-            item.duration = probe_audio_duration(path)
+            item.duration = self._probe_and_cache_duration(path)
 
         player = getattr(voice_client, "_player", None)
         if player is not None:
@@ -3814,11 +4208,21 @@ class MyClient(discord.Client):
 
         if before_opts:
             try:
-                raw_audio = discord.FFmpegPCMAudio(path, before_options=before_opts)
+                raw_audio = discord.FFmpegPCMAudio(
+                    path, before_options=before_opts, options="-vn"
+                )
+            except TypeError:
+                try:
+                    raw_audio = discord.FFmpegPCMAudio(
+                        path, before_options=before_opts
+                    )
+                except TypeError:
+                    raw_audio = discord.FFmpegPCMAudio(path)
+        else:
+            try:
+                raw_audio = discord.FFmpegPCMAudio(path, options="-vn")
             except TypeError:
                 raw_audio = discord.FFmpegPCMAudio(path)
-        else:
-            raw_audio = discord.FFmpegPCMAudio(path)
 
         vol = max(
             MIN_VOLUME_PERCENT / 100.0,
