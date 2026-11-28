@@ -1,6 +1,6 @@
 import asyncio
 from collections import defaultdict, deque
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 import json
 import os
 import random
@@ -9,7 +9,7 @@ import subprocess
 import threading
 import time
 import urllib.error
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 import urllib.request
 import discord
 import yt_dlp
@@ -28,6 +28,7 @@ MIN_VOLUME_PERCENT = 0.0
 MAX_VOLUME_PERCENT = 200.0
 AUDIO_EXTENSIONS = {".mp3", ".flac", ".wav", ".ogg", ".m4a", ".opus", ".aac"}
 PLAYLIST_EXTENSION = ".playlist"
+MAX_SAVE_PATH_LENGTH = 100
 SEARCHABLE_EXTENSIONS = AUDIO_EXTENSIONS | {PLAYLIST_EXTENSION}
 PREFETCH_URL_COUNT = 5
 PROGRESS_BAR_LENGTH = 16
@@ -43,7 +44,7 @@ HELP_PAGE_1_COMMANDS = (
 )
 
 YDL_OPTS = {
-    "outtmpl": "%(uploader)s - %(title)s[%(id)s].%(ext)s",
+    "outtmpl": "%(uploader).40B - %(title).120B[%(id)s].%(ext)s",
     "paths": {"home": MUSIC_FOLDER},
     "format": "bestaudio/best",
     "keepvideo": False,
@@ -106,6 +107,25 @@ def normalize_url(text: str) -> str:
     if text.startswith("www."):
         return "https://" + text
     return text
+
+
+def extract_youtube_video_id(url: str) -> str | None:
+    """Extract a single-video YouTube ID from common URL formats, or None for playlists/non-YouTube."""
+    parsed = urlparse(normalize_url(url))
+    host = parsed.netloc.lower()
+    qs = parse_qs(parsed.query)
+    if "list" in qs:
+        return None
+    if host == "youtu.be" or host.endswith(".youtu.be"):
+        parts = [p for p in parsed.path.split("/") if p]
+        return parts[0] if parts else None
+    if host.endswith("youtube.com") or host.endswith("youtube-nocookie.com"):
+        if "v" in qs and qs["v"]:
+            return qs["v"][0]
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
+            return parts[1]
+    return None
 
 
 def format_seconds(seconds: float | None, unknown_label: str = "Unknown") -> str:
@@ -296,7 +316,11 @@ def probe_audio_duration(file_path: str) -> float | None:
     return None
 
 
-def find_matching_files(pattern: str, music_folder: str | None = None) -> list[str]:
+def find_matching_files(
+    pattern: str,
+    music_folder: str | None = None,
+    allowed_extensions: set[str] | None = None,
+) -> list[str]:
     """Search music_folder for audio files and .playlist files matching pattern.
 
     - If pattern is an exact local path to a file relative to music_folder,
@@ -321,11 +345,14 @@ def find_matching_files(pattern: str, music_folder: str | None = None) -> list[s
         os.path.normpath(stripped_pattern).replace("\\", "/"),
     }
 
+    if allowed_extensions is None:
+        allowed_extensions = SEARCHABLE_EXTENSIONS
+
     all_valid_files: list[tuple[str, str]] = []
     for root, _, files in os.walk(music_folder):
         for file in files:
             ext = os.path.splitext(file)[1].lower()
-            if ext in SEARCHABLE_EXTENSIONS:
+            if ext in allowed_extensions:
                 full_path = os.path.join(root, file)
                 rel_path = os.path.relpath(full_path, music_folder).replace("\\", "/")
                 all_valid_files.append((rel_path, full_path))
@@ -372,16 +399,18 @@ class QueueItem:
     added_by: str | None = None
     thumbnail: str | None = None
     batch_id: int | None = None
+    stream_url: str | None = field(default=None, repr=False)
+    known_on_disk: InitVar[bool] = False
     download_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
-    def __post_init__(self):
+    def __post_init__(self, known_on_disk: bool = False):
         if self.local_path:
             parsed_author, _, parsed_vid = parse_filename_metadata(self.local_path)
             if not self.author and parsed_author:
                 self.author = parsed_author
             if not self.video_id and parsed_vid:
                 self.video_id = parsed_vid
-            if os.path.exists(self.local_path):
+            if known_on_disk or os.path.exists(self.local_path):
                 self.download_event.set()
         if not self.thumbnail and self.video_id:
             self.thumbnail = f"https://i.ytimg.com/vi/{self.video_id}/hqdefault.jpg"
@@ -728,6 +757,7 @@ class MyClient(discord.Client):
         self.language: dict[int, str] = defaultdict(lambda: "en")
         self.url_cache: dict[str, str] = {}
         self.video_id_cache: dict[str, str] = {}
+        self.resolved_url_cache: dict[str, list[dict]] = {}
         self.metadata_cache: dict[str, dict[str, object]] = {}
         self.lyrics_cache: dict[str, dict[str, str]] = {}
         self.inflight_downloads: dict[
@@ -1608,9 +1638,9 @@ class MyClient(discord.Client):
                     self.update_url_mapping(info["webpage_url"], opus_path)
                 return opus_path, duration, title, video_id
 
-        # Actually download and convert to .opus, then update the on-disk mapping
+        # Actually download and convert to .opus using the already-extracted info
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
-            info = ydl.extract_info(query_or_url, download=True)
+            info = ydl.process_ie_result(info, download=True)
             if "entries" in info:
                 entries = [e for e in info["entries"] if e]
                 info = entries[0]
@@ -1698,6 +1728,105 @@ class MyClient(discord.Client):
         finally:
             self.inflight_downloads.pop(dedup_key, None)
 
+    def _probe_stream_sync(self, query_or_url: str):
+        probe_opts = dict(YDL_OPTS)
+        probe_opts["skip_download"] = True
+        probe_opts["quiet"] = True
+        probe_opts["no_warnings"] = True
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            info = ydl.extract_info(query_or_url, download=False)
+            if "entries" in info:
+                entries = [e for e in info["entries"] if e]
+                if not entries:
+                    raise ValueError(f"No results found for {query_or_url}")
+                info = entries[0]
+
+            video_id = info.get("id")
+            duration = info.get("duration")
+            title = info.get("title")
+            webpage_url = info.get("webpage_url")
+            existing = self.get_cached_download(
+                query_or_url if is_url(query_or_url) else webpage_url,
+                video_id,
+            )
+            if existing:
+                self._extract_info_metadata(info, existing)
+                if is_url(query_or_url):
+                    self.update_url_mapping(query_or_url, existing)
+                if webpage_url:
+                    self.update_url_mapping(webpage_url, existing)
+                return existing, None, duration, title, video_id, webpage_url
+
+            prepared = ydl.prepare_filename(info)
+            base, _ = os.path.splitext(prepared)
+            opus_path = base + ".opus"
+            if os.path.isfile(opus_path):
+                self._extract_info_metadata(info, opus_path)
+                if video_id:
+                    self.video_id_cache[video_id] = opus_path
+                if is_url(query_or_url):
+                    self.update_url_mapping(query_or_url, opus_path)
+                if webpage_url:
+                    self.update_url_mapping(webpage_url, opus_path)
+                return opus_path, None, duration, title, video_id, webpage_url
+
+            stream_url = info.get("url")
+            if not stream_url and info.get("requested_formats"):
+                stream_url = info["requested_formats"][0].get("url")
+            self._extract_info_metadata(info, None)
+            return None, stream_url, duration, title, video_id, webpage_url
+
+    async def prepare_first_item_for_stream(self, item: QueueItem):
+        if item.local_path and os.path.isfile(item.local_path):
+            self._apply_cached_metadata(item)
+            item.download_event.set()
+            return
+
+        cached = self.get_cached_download(item.url, item.video_id)
+        if cached:
+            item.local_path = cached
+            self._apply_cached_metadata(item)
+            item.download_event.set()
+            return
+
+        target = item.url or item.title
+        (
+            local_path,
+            stream_url,
+            duration,
+            title,
+            video_id,
+            webpage_url,
+        ) = await asyncio.to_thread(self._probe_stream_sync, target)
+
+        if video_id and not item.video_id:
+            item.video_id = video_id
+        if duration is not None:
+            item.duration = duration
+        if title and (not item.title or item.title == item.url or item.title == target):
+            item.title = title
+        if webpage_url and not item.url:
+            item.url = webpage_url
+
+        if local_path:
+            item.local_path = local_path
+            self._apply_cached_metadata(item)
+            item.download_event.set()
+            return
+
+        if stream_url:
+            item.stream_url = stream_url
+            self._apply_cached_metadata(item)
+        else:
+            # Fallback to full download if no direct stream URL was returned
+            await self.ensure_item_downloaded(item)
+
+    async def _background_download_item(self, item: QueueItem):
+        try:
+            await self.ensure_item_downloaded(item)
+        except Exception:
+            pass
+
     def trigger_background_downloads(self, guild_id: int):
         existing_task = self.prefetch_tasks.get(guild_id)
         if existing_task and not existing_task.done():
@@ -1720,7 +1849,7 @@ class MyClient(discord.Client):
 
                 # Find the 5 leftmost URL items in the queue
                 leftmost_url_items: list[QueueItem] = []
-                for item in list(queue):
+                for item in queue:
                     if item.url is not None:
                         leftmost_url_items.append(item)
                         if len(leftmost_url_items) >= PREFETCH_URL_COUNT:
@@ -2285,11 +2414,55 @@ class MyClient(discord.Client):
             except Exception:
                 pass
 
-    async def handle_play_command(self, message, query: str, play_next: bool = False):
+    def _local_match_to_items(
+        self, match_path: str, requester_name: str
+    ) -> list[QueueItem]:
+        if match_path.lower().endswith(PLAYLIST_EXTENSION):
+            return self.load_playlist_file(match_path, added_by=requester_name)
+        rel_name = (
+            match_path[len(MUSIC_FOLDER) :]
+            if match_path.startswith(MUSIC_FOLDER)
+            else os.path.relpath(match_path, MUSIC_FOLDER)
+        ).replace("\\", "/")
+        item = QueueItem(
+            title=rel_name,
+            local_path=match_path,
+            added_by=requester_name,
+            known_on_disk=True,
+        )
+        self._apply_cached_metadata(item)
+        return [item]
+
+    def _resolve_local_mode_sync(
+        self, query: str, requester_name: str, mode: str
+    ) -> tuple[list[str], list[QueueItem]]:
+        allowed_exts = AUDIO_EXTENSIONS if mode == "batch" else SEARCHABLE_EXTENSIONS
+        matches = find_matching_files(
+            query, MUSIC_FOLDER, allowed_extensions=allowed_exts
+        )
+        if not matches:
+            return matches, []
+        if mode == "batch":
+            items: list[QueueItem] = []
+            for match_path in matches:
+                items.extend(self._local_match_to_items(match_path, requester_name))
+            return matches, items
+        if mode == "local" and len(matches) > 1:
+            return matches, []
+        return matches, self._local_match_to_items(matches[0], requester_name)
+
+    async def handle_play_command(
+        self,
+        message,
+        query: str,
+        play_next: bool = False,
+        mode: str = "default",
+        cmd_name: str | None = None,
+    ):
         text_channel = message.channel
         guild_id = text_channel.guild.id
         self.last_text_channel[guild_id] = text_channel
-        cmd_name = "%playnext" if play_next else "%play"
+        cmd_name = cmd_name or ("%playnext" if play_next else "%play")
 
         if not query:
             await text_channel.send(self.t(guild_id, "play_usage", cmd_name=cmd_name))
@@ -2308,35 +2481,79 @@ class MyClient(discord.Client):
             or str(message.author)
         )
 
-        voice_client = await self.get_voice_client(voice_channel)
+        voice_client = self.voice_client.get(guild_id)
         items_to_add: list[QueueItem] = []
         status_msg = None
 
         try:
-            if is_url(query):
+            if mode in ("batch", "local", "first"):
+                matches, resolved_items = await asyncio.to_thread(
+                    self._resolve_local_mode_sync, query, requester_name, mode
+                )
+                if mode == "local" and len(matches) > 1:
+                    shown = matches[:5]
+                    lines = [
+                        f"{idx}. ```{os.path.relpath(p, MUSIC_FOLDER).replace(chr(92), '/')}```"
+                        for idx, p in enumerate(shown, start=1)
+                    ]
+                    output = self.t(
+                        guild_id,
+                        "lplay_multiple",
+                        total=len(matches),
+                        shown=len(shown),
+                    ) + "\n\n".join(lines)
+                    await text_channel.send(output)
+                    return
+                if not resolved_items:
+                    await text_channel.send(
+                        self.t(guild_id, "find_none", pattern=query)
+                    )
+                    return
+                items_to_add.extend(resolved_items)
+            elif is_url(query):
                 norm_url = normalize_url(query)
-                cached = self.get_cached_download(norm_url)
+                vid_id = extract_youtube_video_id(norm_url)
+                cached = self.get_cached_download(norm_url, vid_id)
                 if cached:
+                    if norm_url not in self.url_cache:
+                        self.update_url_mapping(norm_url, cached)
                     rel_name = os.path.relpath(cached, MUSIC_FOLDER).replace("\\", "/")
                     item = QueueItem(
                         title=rel_name,
                         local_path=cached,
                         url=norm_url,
+                        video_id=vid_id,
                         added_by=requester_name,
                     )
                     self._apply_cached_metadata(item)
                     items_to_add.append(item)
                 else:
-                    search_text = self.t(guild_id, "searching", query=query)
-                    status_msg = await self._safe_send(
-                        text_channel,
-                        None,
-                        embed=self.build_searching_embed(guild_id, query),
-                        fallback_text=search_text,
+                    entries = self.resolved_url_cache.get(norm_url) or (
+                        self.resolved_url_cache.get(f"id:{vid_id}") if vid_id else None
                     )
-                    entries = await asyncio.to_thread(
-                        self._extract_url_entries_sync, norm_url
-                    )
+                    if entries is None:
+                        search_text = self.t(guild_id, "searching", query=query)
+                        status_msg = await self._safe_send(
+                            text_channel,
+                            None,
+                            embed=self.build_searching_embed(guild_id, query),
+                            fallback_text=search_text,
+                        )
+                        entries = await asyncio.to_thread(
+                            self._extract_url_entries_sync, norm_url
+                        )
+                        if entries:
+                            self.resolved_url_cache[norm_url] = entries
+                            if len(entries) == 1:
+                                first_entry = entries[0]
+                                if first_entry.get("id"):
+                                    self.resolved_url_cache[
+                                        f"id:{first_entry['id']}"
+                                    ] = entries
+                                if first_entry.get("url"):
+                                    self.resolved_url_cache[
+                                        normalize_url(first_entry["url"])
+                                    ] = entries
                     if len(entries) > 1:
                         # Playlist URL: add all individual song URLs to queue
                         for entry in entries:
@@ -2356,50 +2573,41 @@ class MyClient(discord.Client):
                             self._apply_cached_metadata(q_item)
                             items_to_add.append(q_item)
                     else:
-                        # Single song URL: download as .opus (or reuse if already downloaded)
+                        # Single song URL: reuse cached file if present, otherwise stream/download asynchronously
                         entry = (
                             entries[0]
                             if entries
                             else {
                                 "url": norm_url,
-                                "id": None,
+                                "id": vid_id,
                                 "title": norm_url,
                                 "duration": None,
                                 "author": None,
                                 "thumbnail": None,
                             }
                         )
+                        entry_url = entry.get("url") or norm_url
+                        entry_vid_id = entry.get("id") or vid_id
+                        existing = self.get_cached_download(entry_url, entry_vid_id)
                         item = QueueItem(
                             title=entry.get("title") or norm_url,
-                            url=entry.get("url") or norm_url,
-                            video_id=entry.get("id"),
+                            local_path=existing,
+                            url=entry_url,
+                            video_id=entry_vid_id,
                             duration=entry.get("duration"),
                             author=entry.get("author"),
                             added_by=requester_name,
                             thumbnail=entry.get("thumbnail"),
                         )
-                        await self.ensure_item_downloaded(item)
+                        self._apply_cached_metadata(item)
                         items_to_add.append(item)
             else:
                 # Search local music directory using %find matching rules
                 matches = find_matching_files(query, MUSIC_FOLDER)
                 if len(matches) == 1:
-                    match_path = matches[0]
-                    if match_path.lower().endswith(PLAYLIST_EXTENSION):
-                        items_to_add.extend(
-                            self.load_playlist_file(match_path, added_by=requester_name)
-                        )
-                    else:
-                        rel_name = os.path.relpath(match_path, MUSIC_FOLDER).replace(
-                            "\\", "/"
-                        )
-                        item = QueueItem(
-                            title=rel_name,
-                            local_path=match_path,
-                            added_by=requester_name,
-                        )
-                        self._apply_cached_metadata(item)
-                        items_to_add.append(item)
+                    items_to_add.extend(
+                        self._local_match_to_items(matches[0], requester_name)
+                    )
                 else:
                     # 0 or multiple local matches: search on YouTube and download as .opus
                     search_text = self.t(guild_id, "searching", query=query)
@@ -2447,6 +2655,13 @@ class MyClient(discord.Client):
             # Start first song as fast as possible, then download remaining 5 leftmost URLs in background
             first_item = self.queue[guild_id].popleft()
             self.trigger_background_downloads(guild_id)
+            is_connected_fn = getattr(voice_client, "is_connected", None)
+            voice_task = None
+            if voice_client is None or (
+                callable(is_connected_fn) and not is_connected_fn()
+            ):
+                voice_task = asyncio.create_task(self.get_voice_client(voice_channel))
+
             if not first_item.local_path or not os.path.isfile(first_item.local_path):
                 if status_msg is None:
                     search_text = self.t(guild_id, "searching", query=first_item.title)
@@ -2457,8 +2672,10 @@ class MyClient(discord.Client):
                         fallback_text=search_text,
                     )
                 try:
-                    await self.ensure_item_downloaded(first_item)
+                    await self.prepare_first_item_for_stream(first_item)
                 except Exception as exc:
+                    if voice_task is not None and not voice_task.done():
+                        voice_task.cancel()
                     err_text = self.t(
                         guild_id, "play_error", query=first_item.title, err=exc
                     )
@@ -2471,6 +2688,11 @@ class MyClient(discord.Client):
                         fallback_text=err_text,
                     )
                     return
+
+                if (
+                    not first_item.local_path or not os.path.isfile(first_item.local_path)
+                ) and first_item.stream_url:
+                    asyncio.create_task(self._background_download_item(first_item))
 
             # Always send/edit the song info card first
             card_text, card_embed = self.build_added_to_queue_display(
@@ -2488,11 +2710,8 @@ class MyClient(discord.Client):
                 fallback_text=card_text,
             )
 
-            is_connected_fn = getattr(voice_client, "is_connected", None)
-            if voice_client is None or (
-                callable(is_connected_fn) and not is_connected_fn()
-            ):
-                voice_client = await self.get_voice_client(voice_channel)
+            if voice_task is not None:
+                voice_client = await voice_task
             self.play(voice_client, first_item)
             if was_queue_empty_and_inactive:
                 await self.recreate_player_message(guild_id)
@@ -2988,12 +3207,28 @@ class MyClient(discord.Client):
             )
             return
 
-        if cmd == "%play":
-            await self.handle_play_command(message, arg.strip(), play_next=False)
-            return
-
-        if cmd == "%playnext":
-            await self.handle_play_command(message, arg.strip(), play_next=True)
+        if cmd in (
+            "%play",
+            "%playnext",
+            "%bplay",
+            "%bplaynext",
+            "%lplay",
+            "%lplaynext",
+            "%fplay",
+            "%fplaynext",
+        ):
+            is_next = cmd in ("%playnext", "%bplaynext", "%lplaynext", "%fplaynext")
+            if cmd in ("%bplay", "%bplaynext"):
+                play_mode = "batch"
+            elif cmd in ("%lplay", "%lplaynext"):
+                play_mode = "local"
+            elif cmd in ("%fplay", "%fplaynext"):
+                play_mode = "first"
+            else:
+                play_mode = "default"
+            await self.handle_play_command(
+                message, arg.strip(), play_next=is_next, mode=play_mode, cmd_name=cmd
+            )
             return
 
         if cmd == "%lyrics":
@@ -3197,13 +3432,13 @@ class MyClient(discord.Client):
             await text_channel.send(output)
             return
 
-        if cmd == "%skip":
+        if cmd in ("%skip", "%stop"):
             voice_channel = await self.get_user_voice_channel(message)
             voice_client = self.voice_client.get(guild_id)
             if voice_client is None and voice_channel is not None:
                 voice_client = await self.get_voice_client(voice_channel)
 
-            skip_arg = arg.strip().lower()
+            skip_arg = "all" if cmd == "%stop" else arg.strip().lower()
 
             if skip_arg == "":
                 amount = 1
@@ -3372,6 +3607,11 @@ class MyClient(discord.Client):
             await self._delete_user_message(message)
             if not playlist_name.lower().endswith(PLAYLIST_EXTENSION):
                 playlist_name += PLAYLIST_EXTENSION
+            if len(playlist_name) > MAX_SAVE_PATH_LENGTH:
+                await text_channel.send(
+                    self.t(guild_id, "save_too_long", max_len=MAX_SAVE_PATH_LENGTH)
+                )
+                return
 
             entries: list[str] = []
             current_item = self.now_playing_item.get(guild_id)
@@ -3389,12 +3629,21 @@ class MyClient(discord.Client):
                 await text_channel.send(self.t(guild_id, "save_empty"))
                 return
 
-            save_path = os.path.join(MUSIC_FOLDER, playlist_name)
-            os.makedirs(os.path.dirname(save_path) or MUSIC_FOLDER, exist_ok=True)
+            music_root = os.path.realpath(MUSIC_FOLDER)
+            save_path = os.path.realpath(os.path.join(music_root, playlist_name))
+            try:
+                in_music_root = os.path.commonpath([music_root, save_path]) == music_root
+            except ValueError:
+                in_music_root = False
+            if not in_music_root or save_path == music_root:
+                await text_channel.send(self.t(guild_id, "save_invalid_path"))
+                return
+
+            os.makedirs(os.path.dirname(save_path) or music_root, exist_ok=True)
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(entries, f, indent=2, ensure_ascii=False)
 
-            rel_saved = os.path.relpath(save_path, MUSIC_FOLDER).replace("\\", "/")
+            rel_saved = os.path.relpath(save_path, music_root).replace("\\", "/")
             await text_channel.send(
                 self.t(guild_id, "saved_playlist", count=len(entries), name=rel_saved)
             )
@@ -3534,10 +3783,16 @@ class MyClient(discord.Client):
             item = QueueItem(title=rel_name, local_path=path)
         else:
             item = item_or_path
-            path = item.local_path
+            if item.local_path and os.path.isfile(item.local_path):
+                path = item.local_path
+            elif item.stream_url:
+                path = item.stream_url
+            else:
+                path = item.local_path
 
         self._apply_cached_metadata(item)
-        if item.duration is None and path:
+        is_remote_stream = bool(path and is_url(path))
+        if item.duration is None and path and not is_remote_stream:
             item.duration = probe_audio_duration(path)
 
         player = getattr(voice_client, "_player", None)
@@ -3550,11 +3805,16 @@ class MyClient(discord.Client):
                     pass
 
         start_offset = max(0.0, float(start_at))
+        before_opts_parts = []
+        if is_remote_stream:
+            before_opts_parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
         if start_offset > 0:
+            before_opts_parts.append(f"-ss {start_offset}")
+        before_opts = " ".join(before_opts_parts)
+
+        if before_opts:
             try:
-                raw_audio = discord.FFmpegPCMAudio(
-                    path, before_options=f"-ss {start_offset}"
-                )
+                raw_audio = discord.FFmpegPCMAudio(path, before_options=before_opts)
             except TypeError:
                 raw_audio = discord.FFmpegPCMAudio(path)
         else:
